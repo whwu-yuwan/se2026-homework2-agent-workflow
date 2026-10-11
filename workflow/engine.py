@@ -1,10 +1,11 @@
 """
 工作流引擎
-支持顺序执行、条件分支、循环控制、错误恢复
+支持顺序执行、条件分支、循环控制、并行步骤、错误恢复
 """
 
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Dict, List, Optional, Any
 
 from workflow.context import WorkflowContext, StepResult
@@ -69,6 +70,25 @@ class LoopGroup:
         self.max_rounds = max_rounds
 
 
+class ParallelGroup:
+    """并行步骤组
+
+    包含一组步骤，同时并发执行（适用于独立任务，如同时审查多个文件）
+    """
+
+    def __init__(self, name: str, steps: List[Step], max_workers: int = 4):
+        """定义并行步骤组
+
+        Args:
+            name: 并行组名称
+            steps: 并行执行的步骤列表
+            max_workers: 最大并发数
+        """
+        self.name = name
+        self.steps = steps
+        self.max_workers = max_workers
+
+
 class WorkflowEngine:
     """工作流引擎
 
@@ -76,6 +96,7 @@ class WorkflowEngine:
     - 顺序执行步骤
     - 条件分支（通过 Step.condition）
     - 循环控制（通过 LoopGroup）
+    - 并行执行（通过 ParallelGroup，适用于独立任务）
     - 错误恢复（单步失败可配置是否中断）
     - 执行日志与状态追踪
     """
@@ -90,9 +111,10 @@ class WorkflowEngine:
         self.name = name
         self._steps: List[Step] = []
         self._loop_groups: List[LoopGroup] = []
-        self._execution_order: List[str] = []  # 记录执行顺序："step:name" 或 "loop:name"
+        self._parallel_groups: List[ParallelGroup] = []
+        self._execution_order: List[str] = []  # "step:name" | "loop:name" | "parallel:name"
         self._flow_logger = FlowLogger(verbose=verbose)
-        self._fail_fast = True  # 单步失败是否立即终止
+        self._fail_fast = True
 
     def add_step(self, step: Step) -> "WorkflowEngine":
         """添加一个步骤"""
@@ -104,6 +126,12 @@ class WorkflowEngine:
         """添加一个循环组"""
         self._loop_groups.append(loop)
         self._execution_order.append(f"loop:{loop.name}")
+        return self
+
+    def add_parallel(self, parallel: ParallelGroup) -> "WorkflowEngine":
+        """添加一个并行组"""
+        self._parallel_groups.append(parallel)
+        self._execution_order.append(f"parallel:{parallel.name}")
         return self
 
     def _run_step(self, step: Step, ctx: WorkflowContext) -> StepResult:
@@ -181,7 +209,11 @@ class WorkflowEngine:
             ctx: 工作流上下文
         """
         for round_num in range(1, loop.max_rounds + 1):
-            ctx.review_round = round_num
+            # 使用通用轮次计数器（同时兼容 review_round 便捷属性）
+            ctx.set(f"{loop.name}_round", round_num)
+            if hasattr(ctx, 'review_round'):
+                ctx.review_round = round_num
+
             self._flow_logger.on_loop_start(round_num, loop.max_rounds)
 
             # 执行循环内的每个步骤
@@ -197,6 +229,54 @@ class WorkflowEngine:
                 break
         else:
             logger.warning(f"循环 '{loop.name}' 达到最大轮次 {loop.max_rounds}")
+
+    def _run_parallel(self, parallel: ParallelGroup, ctx: WorkflowContext) -> None:
+        """并行执行一组步骤
+
+        Args:
+            parallel: 并行组定义
+            ctx: 工作流上下文
+        """
+        self._flow_logger.on_step_start(parallel.name, f"并行({len(parallel.steps)}个)")
+        start_time = time.time()
+
+        results = {}
+        with ThreadPoolExecutor(max_workers=parallel.max_workers) as executor:
+            future_to_step = {}
+            for step in parallel.steps:
+                if step.condition and not step.condition(ctx):
+                    continue
+                future = executor.submit(self._run_step, step, ctx)
+                future_to_step[future] = step
+
+            for future in as_completed(future_to_step):
+                step = future_to_step[future]
+                try:
+                    result = future.result()
+                    results[step.name] = result
+                except Exception as e:
+                    logger.error(f"并行步骤 '{step.name}' 异常: {e}")
+                    results[step.name] = StepResult(
+                        step_name=step.name,
+                        agent_name=step.agent.name,
+                        status="failed",
+                        output=str(e),
+                        duration=0.0,
+                    )
+
+        duration = time.time() - start_time
+        success_count = sum(1 for r in results.values() if r.status == "success")
+        status = "success" if success_count == len(results) else "failed"
+
+        group_result = StepResult(
+            step_name=parallel.name,
+            agent_name=f"并行组({len(parallel.steps)})",
+            status=status,
+            output=f"{success_count}/{len(results)} 成功",
+            duration=duration,
+        )
+        self._flow_logger.on_step_end(group_result)
+        ctx.add_step_result(group_result)
 
     def run(self, ctx: WorkflowContext) -> WorkflowContext:
         """执行工作流
@@ -226,6 +306,11 @@ class WorkflowEngine:
                     loop = next((l for l in self._loop_groups if l.name == name), None)
                     if loop:
                         self._run_loop(loop, ctx)
+
+                elif kind == "parallel":
+                    parallel = next((p for p in self._parallel_groups if p.name == name), None)
+                    if parallel:
+                        self._run_parallel(parallel, ctx)
 
             ctx.status = "completed"
             self._flow_logger.on_workflow_end("completed")

@@ -73,18 +73,20 @@ class TestBaseAgent:
             agent.run(long_input)
 
     @patch("agents.base.ChatOpenAI")
-    def test_review_agent_no_tools(self, mock_llm):
-        """测试 ReviewAgent 没有工具"""
+    def test_review_agent_has_tools(self, mock_llm):
+        """测试 ReviewAgent 绑定了工具"""
         agent = ReviewAgent()
-        assert agent.tools == []
-        assert agent.tool_map == {}
+        assert len(agent.tools) > 0
+        assert "read_file" in agent.tool_map
+        assert "search_code" in agent.tool_map
 
     @patch("agents.base.ChatOpenAI")
-    def test_fix_agent_no_tools(self, mock_llm):
-        """测试 FixAgent 没有工具"""
+    def test_fix_agent_has_tools(self, mock_llm):
+        """测试 FixAgent 绑定了工具"""
         agent = FixAgent()
-        assert agent.tools == []
-        assert agent.tool_map == {}
+        assert len(agent.tools) > 0
+        assert "read_file" in agent.tool_map
+        assert "execute_python" in agent.tool_map
 
     @patch("agents.base.ChatOpenAI")
     def test_code_agent_has_tools(self, mock_llm):
@@ -94,6 +96,28 @@ class TestBaseAgent:
         assert "read_file" in agent.tool_map
         assert "list_directory" in agent.tool_map
         assert "search_code" in agent.tool_map
+
+    @patch("agents.base.ChatOpenAI")
+    def test_custom_system_prompt(self, mock_llm):
+        """测试构造函数传入自定义 system_prompt"""
+        custom_prompt = "你是自定义助手"
+        agent = CodeAgent(system_prompt=custom_prompt)
+        assert agent.system_prompt == custom_prompt
+        assert agent.messages[0].content == custom_prompt
+
+    @patch("agents.base.ChatOpenAI")
+    def test_default_system_prompt(self, mock_llm):
+        """测试默认 system_prompt"""
+        agent = CodeAgent()
+        assert agent.system_prompt == CodeAgent.default_system_prompt
+
+    @patch("agents.base.ChatOpenAI")
+    def test_custom_tools(self, mock_llm):
+        """测试构造函数传入自定义 tools"""
+        from tools import read_file
+        agent = CodeAgent(tools=[read_file])
+        assert len(agent.tools) == 1
+        assert "read_file" in agent.tool_map
 
     # ─── run() 方法测试 ───────────────────────────────────────
 
@@ -105,10 +129,14 @@ class TestBaseAgent:
 
         # 模拟 LLM 返回文本回复
         response = AIMessage(content="这是回复")
+        response.tool_calls = []
         response.usage_metadata = {"total_tokens": 50}
         mock_llm.invoke.return_value = response
 
-        agent = ReviewAgent()  # 无工具的 Agent
+        agent = ReviewAgent()
+        # 覆盖 llm_with_tools 为同一个 mock（ReviewAgent 现在有工具）
+        agent.llm_with_tools = mock_llm
+
         result = agent.run("请审查这段代码")
 
         assert result == "这是回复"

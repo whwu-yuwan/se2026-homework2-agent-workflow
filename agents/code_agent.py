@@ -40,8 +40,9 @@ class CodeAgent(BaseAgent):
     """编码/读取 Agent
 
     负责读取代码文件，理解代码结构，输出完整代码内容
+    支持通过构造函数传入自定义 system_prompt 和 tools
     """
 
     name = "CodeAgent"
-    system_prompt = CODE_SYSTEM_PROMPT
-    tools = READ_TOOLS
+    default_system_prompt = CODE_SYSTEM_PROMPT
+    default_tools = READ_TOOLS

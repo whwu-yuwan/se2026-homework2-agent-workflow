@@ -1,12 +1,19 @@
 """
 审查 Agent
 负责分析代码质量，发现 bug、安全问题、代码风格问题，给出改进建议
-不使用工具，纯粹依赖 LLM 的代码分析能力
+绑定 read_file 和 search_code 工具，可主动查阅相关代码文件
 """
 
 from agents.base import BaseAgent
+from tools import READ_TOOLS
 
 REVIEW_SYSTEM_PROMPT = """你是一个严格的代码审查专家（Review Agent），负责审查代码质量并发现问题。
+
+## 你的能力
+
+1. **读取文件**：使用 `read_file` 工具读取代码文件的完整内容
+2. **搜索代码**：使用 `search_code` 工具查找相关代码引用和依赖
+3. **代码分析**：基于 LLM 能力深度分析代码逻辑
 
 ## 你的职责
 
@@ -18,10 +25,11 @@ REVIEW_SYSTEM_PROMPT = """你是一个严格的代码审查专家（Review Agent
 
 ## 审查流程
 
-1. 仔细阅读代码，逐行分析
-2. 对每个问题标注严重程度（critical / warning / info）
-3. 给出具体的修复建议
-4. 最后给出总体评分和总结
+1. 如果需要查看依赖文件或相关代码，使用 `read_file` 或 `search_code` 工具
+2. 仔细阅读代码，逐行分析
+3. 对每个问题标注严重程度（critical / warning / info）
+4. 给出具体的修复建议
+5. 最后给出总体评分和总结
 
 ## 输出格式
 
@@ -63,10 +71,11 @@ PASS / NEEDS_FIX
 class ReviewAgent(BaseAgent):
     """审查 Agent
 
-    分析代码质量，发现 bug 和问题，输出审查报告
-    不使用工具，纯 LLM 分析
+    分析代码质量，发现 bug 和问题，输出审查报告。
+    绑定 read_file/search_code 工具，可主动查阅相关代码文件以辅助审查。
+    支持通过构造函数传入自定义 system_prompt 和 tools。
     """
 
     name = "ReviewAgent"
-    system_prompt = REVIEW_SYSTEM_PROMPT
-    tools = []
+    default_system_prompt = REVIEW_SYSTEM_PROMPT
+    default_tools = READ_TOOLS

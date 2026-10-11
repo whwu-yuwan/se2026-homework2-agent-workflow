@@ -28,11 +28,19 @@ class BaseAgent:
     """
 
     name: str = "base"
-    system_prompt: str = ""
-    tools: List[BaseTool] = []
+    default_system_prompt: str = ""
+    default_tools: List[BaseTool] = []
 
-    def __init__(self):
-        """初始化 Agent"""
+    def __init__(self, system_prompt: Optional[str] = None, tools: Optional[List[BaseTool]] = None):
+        """初始化 Agent
+
+        Args:
+            system_prompt: 自定义系统提示词（None 则使用类默认值）
+            tools: 自定义工具列表（None 则使用类默认值）
+        """
+        self.system_prompt = system_prompt if system_prompt is not None else self.default_system_prompt
+        self.tools = tools if tools is not None else self.default_tools
+
         self.llm = ChatOpenAI(
             model=config.MODEL_NAME,
             openai_api_key=config.API_KEY,

@@ -8,6 +8,7 @@ from unittest.mock import patch, MagicMock
 
 from workflow.context import WorkflowContext
 from workflows.code_review import _parse_review_conclusion, build_code_review_workflow
+from workflows.doc_generation import build_doc_generation_workflow
 
 
 class TestReviewConclusionParser:
@@ -109,7 +110,6 @@ class TestEndToEndWorkflow:
     """端到端工作流集成测试（Mock Agent）"""
 
     def _make_mock_agent(self, name, responses):
-        """创建一个模拟 Agent"""
         from unittest.mock import MagicMock
         agent = MagicMock()
         agent.name = name
@@ -127,83 +127,112 @@ class TestEndToEndWorkflow:
         agent.run = side_effect
         return agent
 
-    @patch("workflows.code_review.CodeAgent")
-    @patch("workflows.code_review.ReviewAgent")
-    @patch("workflows.code_review.FixAgent")
-    def test_pass_first_round(self, MockFix, MockReview, MockCode):
+    def test_pass_first_round(self):
         """测试第一轮审查就通过（无需修复）"""
-        from workflows.code_review import build_code_review_workflow
+        from unittest.mock import MagicMock
 
-        code_agent = self._make_mock_agent("CodeAgent", ["def hello(): pass"])
-        review_agent = self._make_mock_agent("ReviewAgent", ["代码良好\n\nPASS"])
-        fix_agent = self._make_mock_agent("FixAgent", ["should not run"])
+        mock_registry = MagicMock()
+        mock_registry.create.side_effect = [
+            self._make_mock_agent("CodeAgent", ["def hello(): pass"]),
+            self._make_mock_agent("ReviewAgent", ["代码良好\n\nPASS"]),
+            self._make_mock_agent("FixAgent", ["should not run"]),
+        ]
 
-        MockCode.return_value = code_agent
-        MockReview.return_value = review_agent
-        MockFix.return_value = fix_agent
-
-        ctx = WorkflowContext({"user_input": "test.py"})
-        engine = build_code_review_workflow(verbose=False)
-        ctx = engine.run(ctx)
+        with patch("workflows.code_review.default_registry", mock_registry):
+            ctx = WorkflowContext({"user_input": "test.py"})
+            engine = build_code_review_workflow(verbose=False)
+            ctx = engine.run(ctx)
 
         assert ctx.status == "completed"
-        assert ctx.code == "def hello(): pass"  # 代码未被修改
+        assert ctx.code == "def hello(): pass"
         assert ctx.has_critical_issues is False
 
-    @patch("workflows.code_review.CodeAgent")
-    @patch("workflows.code_review.ReviewAgent")
-    @patch("workflows.code_review.FixAgent")
-    def test_fix_then_pass(self, MockFix, MockReview, MockCode):
+    def test_fix_then_pass(self):
         """测试第一轮有问题，修复后通过"""
-        from workflows.code_review import build_code_review_workflow
+        from unittest.mock import MagicMock
 
-        code_agent = self._make_mock_agent("CodeAgent", ["def div(a,b): return a/b"])
-        review_agent = self._make_mock_agent("ReviewAgent", [
-            "发现除零风险\n\nNEEDS_FIX",  # 第一轮
-            "修复后代码良好\n\nPASS",       # 第二轮
-        ])
-        fix_agent = self._make_mock_agent("FixAgent", [
-            "def div(a,b):\n    if b==0: raise ValueError\n    return a/b"
-        ])
+        mock_registry = MagicMock()
+        mock_registry.create.side_effect = [
+            self._make_mock_agent("CodeAgent", ["def div(a,b): return a/b"]),
+            self._make_mock_agent("ReviewAgent", [
+                "发现除零风险\n\nNEEDS_FIX",
+                "修复后代码良好\n\nPASS",
+            ]),
+            self._make_mock_agent("FixAgent", [
+                "def div(a,b):\n    if b==0: raise ValueError\n    return a/b"
+            ]),
+        ]
 
-        MockCode.return_value = code_agent
-        MockReview.return_value = review_agent
-        MockFix.return_value = fix_agent
-
-        ctx = WorkflowContext({"user_input": "test.py"})
-        engine = build_code_review_workflow(verbose=False)
-        ctx = engine.run(ctx)
+        with patch("workflows.code_review.default_registry", mock_registry):
+            ctx = WorkflowContext({"user_input": "test.py"})
+            engine = build_code_review_workflow(verbose=False)
+            ctx = engine.run(ctx)
 
         assert ctx.status == "completed"
-        assert "ValueError" in ctx.code  # 代码被修复
+        assert "ValueError" in ctx.code
         assert ctx.review_round == 2
 
-    @patch("workflows.code_review.CodeAgent")
-    @patch("workflows.code_review.ReviewAgent")
-    @patch("workflows.code_review.FixAgent")
-    def test_max_rounds_reached(self, MockFix, MockReview, MockCode):
+    def test_max_rounds_reached(self):
         """测试达到最大循环轮次"""
         import config as cfg
-        from workflows.code_review import build_code_review_workflow
+        from unittest.mock import MagicMock
 
-        code_agent = self._make_mock_agent("CodeAgent", ["buggy code"])
-        # 每轮都有问题
-        review_agent = self._make_mock_agent("ReviewAgent", [
-            "问题1\n\nNEEDS_FIX",
-            "问题2\n\nNEEDS_FIX",
-            "问题3\n\nNEEDS_FIX",
-        ])
-        fix_agent = self._make_mock_agent("FixAgent", [
-            "fix1", "fix2", "fix3"
-        ])
+        mock_registry = MagicMock()
+        mock_registry.create.side_effect = [
+            self._make_mock_agent("CodeAgent", ["buggy code"]),
+            self._make_mock_agent("ReviewAgent", [
+                "问题1\n\nNEEDS_FIX",
+                "问题2\n\nNEEDS_FIX",
+                "问题3\n\nNEEDS_FIX",
+            ]),
+            self._make_mock_agent("FixAgent", ["fix1", "fix2", "fix3"]),
+        ]
 
-        MockCode.return_value = code_agent
-        MockReview.return_value = review_agent
-        MockFix.return_value = fix_agent
-
-        ctx = WorkflowContext({"user_input": "test.py"})
-        engine = build_code_review_workflow(verbose=False)
-        ctx = engine.run(ctx)
+        with patch("workflows.code_review.default_registry", mock_registry):
+            ctx = WorkflowContext({"user_input": "test.py"})
+            engine = build_code_review_workflow(verbose=False)
+            ctx = engine.run(ctx)
 
         assert ctx.status == "completed"
         assert ctx.review_round == cfg.MAX_REVIEW_ROUNDS
+
+
+class TestDocGenerationWorkflow:
+    """测试文档生成工作流"""
+
+    @patch("agents.base.ChatOpenAI")
+    def test_build_doc_workflow(self, mock_llm):
+        """测试构建文档生成工作流"""
+        engine = build_doc_generation_workflow(verbose=False)
+        assert engine is not None
+        assert engine.name == "文档生成工作流"
+        assert len(engine._steps) == 3
+        assert len(engine._loop_groups) == 0
+
+    @patch("workflows.doc_generation.default_registry")
+    def test_doc_workflow_steps(self, mock_registry):
+        """测试文档生成工作流步骤编排"""
+        from unittest.mock import MagicMock
+        mock_code_agent = MagicMock()
+        mock_code_agent.name = "CodeAgent"
+        mock_code_agent.run = MagicMock(return_value="code content")
+
+        mock_review_agent = MagicMock()
+        mock_review_agent.name = "ReviewAgent"
+        mock_review_agent.run = MagicMock(return_value="analysis report")
+
+        mock_fix_agent = MagicMock()
+        mock_fix_agent.name = "FixAgent"
+        mock_fix_agent.run = MagicMock(return_value="# README\nDocumentation")
+
+        mock_registry.create.side_effect = [mock_code_agent, mock_review_agent, mock_fix_agent]
+
+        ctx = WorkflowContext({"user_input": "test.py"})
+        engine = build_doc_generation_workflow(verbose=False)
+        ctx = engine.run(ctx)
+
+        assert ctx.status == "completed"
+        assert ctx.get("code") == "code content"
+        assert ctx.get("analysis") == "analysis report"
+        assert ctx.get("documentation") == "# README\nDocumentation"
+        assert ctx.get("analysis_done") is True

@@ -1,15 +1,16 @@
-# 🔍 代码审查工作流 (Code Review Workflow)
+# 🔍 多 Agent 协同工作流系统
 
-一个基于多 Agent 协同的代码审查系统，由 3 个 Agent 组成工作流，自动完成代码读取、审查和修复。
+一个基于多 Agent 协同的工作流系统，由 3 个 Agent 组成可编排的工作流，支持代码审查、文档生成等多种业务流程。
 
 ## ✨ 功能特性
 
-- **多 Agent 协同**：CodeAgent、ReviewAgent、FixAgent 三个 Agent 各司其职
-- **工作流引擎**：支持顺序执行、条件分支、循环控制
-- **自动审查-修复循环**：审查发现问题时自动修复，最多循环 3 轮
+- **3 个 Agent 协同**：CodeAgent（读取代码）、ReviewAgent（审查/分析）、FixAgent（修复/生成文档）
+- **2 个工作流**：代码审查（审查→修复循环）、文档生成（分析→生成文档）
+- **工作流引擎**：支持顺序执行、条件分支、循环控制、**并行执行**
+- **Agent 注册机制**：通过 AgentRegistry 动态创建 Agent，支持自定义 prompt 和 tools
 - **共享状态管理**：Agent 通过 WorkflowContext 传递数据
 - **执行日志**：实时显示每步执行状态和耗时
-- **错误恢复**：单步失败可配置是否中断整个流程
+- **138 个测试全部通过**
 
 ## 🛠️ 技术栈
 
@@ -21,107 +22,59 @@
 
 ## 📦 安装与运行
 
-### 1. 安装依赖
-
 ```bash
 pip install -r requirements.txt
-```
-
-### 2. 设置 API Key
-
-```bash
-# Windows
-set DEEPSEEK_API_KEY=your-api-key-here
-
-# Linux/Mac
-export DEEPSEEK_API_KEY=your-api-key-here
-```
-
-### 3. 运行
-
-```bash
+set DEEPSEEK_API_KEY=your-api-key-here   # Windows
 python main.py
 ```
 
-## 📖 使用示例
+## 📖 使用方式
 
-### 示例 1：审查文件
-
-```
-🧑 You > main.py
-
-🚀 工作流开始: 代码审查工作流
-  ⏳ [读取代码] Agent: CodeAgent ...
-  ✅ [读取代码] 完成 (2.1s)
-
-  🔄 审查-修复循环 第 1/3 轮
-  ⏳ [代码审查] Agent: ReviewAgent ...
-  ✅ [代码审查] 完成 (5.3s)
-     输出: ## 审查报告 ... NEEDS_FIX
-
-  ⏳ [代码修复] Agent: FixAgent ...
-  ✅ [代码修复] 完成 (4.8s)
-
-  🔄 审查-修复循环 第 2/3 轮
-  ⏳ [代码审查] Agent: ReviewAgent ...
-  ✅ [代码审查] 完成 (4.1s)
-     输出: ## 审查报告 ... PASS
-
-  🔄 第 2 轮结果: 审查通过 ✅
-
-✅ 工作流结束: completed (总耗时: 16.3s)
-```
-
-### 示例 2：直接粘贴代码
+运行后选择工作流，输入文件路径或粘贴代码即可：
 
 ```
-🧑 You > def divide(a, b):
-    return a / b
+🧑 You > main.py          # 代码审查工作流
+🧑 You > /workflow         # 切换到文档生成工作流
+🧑 You > /agents           # 查看已注册 Agent
+🧑 You > /verbose          # 切换详细模式
 ```
 
 ## 🏗️ 项目结构
 
 ```
 task2/
-├── main.py                    # CLI 入口
+├── main.py                    # CLI 入口（支持多工作流选择）
 ├── config.py                  # 全局配置
-├── exceptions.py              # 异常体系
+├── exceptions.py              # 异常体系（7 个异常类）
 ├── logger.py                  # 日志配置
-├── tools.py                   # 工具集（文件读取、搜索等）
-├── requirements.txt           # 依赖
-├── README.md                  # 使用文档
-├── Design.md                  # 设计文档
+├── tools.py                   # 工具集（read_file, list_directory, execute_python, search_code）
 ├── agents/
-│   ├── __init__.py
-│   ├── base.py                # BaseAgent 基类
+│   ├── base.py                # BaseAgent 基类（可配置 prompt/tools）
 │   ├── code_agent.py          # 编码 Agent
-│   ├── review_agent.py        # 审查 Agent
-│   └── fix_agent.py           # 修复 Agent
+│   ├── review_agent.py        # 审查 Agent（绑定 read_file/search_code）
+│   ├── fix_agent.py           # 修复 Agent（绑定全部 4 个工具）
+│   └── registry.py            # Agent 注册表
 ├── workflow/
-│   ├── __init__.py
-│   ├── engine.py              # WorkflowEngine 核心引擎
+│   ├── engine.py              # WorkflowEngine（Step + LoopGroup + ParallelGroup）
 │   ├── context.py             # WorkflowContext 共享状态
 │   └── flow_logger.py         # 执行日志
 ├── workflows/
-│   ├── __init__.py
-│   └── code_review.py         # 代码审查工作流定义
-└── tests/
-    ├── __init__.py
-    ├── test_engine.py          # 引擎测试
-    ├── test_agents.py          # Agent 测试
-    └── test_workflow.py        # 端到端工作流测试
+│   ├── code_review.py         # 代码审查工作流
+│   └── doc_generation.py      # 文档生成工作流
+└── tests/                     # 138 个测试
+    ├── test_tools.py          # 工具测试 (22)
+    ├── test_agents.py         # Agent 测试 (30)
+    ├── test_engine.py         # 引擎测试 (29)
+    ├── test_workflow.py       # 工作流测试 (15)
+    ├── test_flow_logger.py    # 日志测试 (17)
+    ├── test_main.py           # CLI 测试 (13)
+    └── test_registry.py       # 注册表测试 (7)
 ```
 
 ## 🧪 运行测试
 
 ```bash
-# 运行所有测试
 pytest tests/ -v
-
-# 运行特定测试
-pytest tests/test_engine.py -v
-pytest tests/test_agents.py -v
-pytest tests/test_workflow.py -v
 ```
 
 ## 🎯 命令说明
@@ -129,12 +82,14 @@ pytest tests/test_workflow.py -v
 | 命令 | 说明 |
 |------|------|
 | `/help` | 显示帮助信息 |
+| `/workflow` | 切换工作流（代码审查/文档生成） |
+| `/agents` | 查看已注册的 Agent 列表 |
 | `/verbose` | 切换详细模式 |
 | `/quit` | 退出程序 |
 
 ## 📝 设计文档
 
-详见 [Design.md](Design.md)
+详见 [Design.md](Design.md)（含 Mermaid 流程图、架构图、已知限制）
 
 ## 📄 License
 

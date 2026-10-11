@@ -6,7 +6,7 @@
 import pytest
 from unittest.mock import MagicMock, patch
 
-from workflow.engine import WorkflowEngine, Step, LoopGroup
+from workflow.engine import WorkflowEngine, Step, LoopGroup, ParallelGroup
 from workflow.context import WorkflowContext, StepResult
 from exceptions import StepError, EngineError
 
@@ -572,3 +572,111 @@ class TestMixedExecution:
         assert ctx.get("step_0_output") == "output_0"
         assert ctx.get("step_4_output") == "output_4"
         assert len(ctx.step_results) == 5
+
+
+class TestParallelGroup:
+    """测试并行步骤组"""
+
+    def test_parallel_execution(self):
+        """测试并行步骤同时执行"""
+        agent1 = MockAgent(responses=["result1"])
+        agent2 = MockAgent(responses=["result2"])
+        agent3 = MockAgent(responses=["result3"])
+
+        ctx = WorkflowContext()
+        engine = WorkflowEngine(verbose=False)
+
+        engine.add_parallel(ParallelGroup(
+            name="并行分析",
+            steps=[
+                Step(
+                    name="分析A",
+                    agent=agent1,
+                    input_fn=lambda ctx: "inputA",
+                    output_fn=lambda ctx, out: ctx.set("a", out),
+                ),
+                Step(
+                    name="分析B",
+                    agent=agent2,
+                    input_fn=lambda ctx: "inputB",
+                    output_fn=lambda ctx, out: ctx.set("b", out),
+                ),
+                Step(
+                    name="分析C",
+                    agent=agent3,
+                    input_fn=lambda ctx: "inputC",
+                    output_fn=lambda ctx, out: ctx.set("c", out),
+                ),
+            ],
+            max_workers=3,
+        ))
+
+        ctx = engine.run(ctx)
+
+        assert ctx.status == "completed"
+        assert ctx.get("a") == "result1"
+        assert ctx.get("b") == "result2"
+        assert ctx.get("c") == "result3"
+        # 并行组结果记录
+        parallel_result = ctx.step_results[-1]
+        assert "3/3" in parallel_result.output
+
+    def test_parallel_with_step_before_and_after(self):
+        """测试 步骤 → 并行 → 步骤 编排"""
+        init_agent = MockAgent(responses=["init"])
+        p1 = MockAgent(responses=["p1"])
+        p2 = MockAgent(responses=["p2"])
+        final = MockAgent(responses=["done"])
+
+        ctx = WorkflowContext()
+        engine = WorkflowEngine(verbose=False)
+
+        engine.add_step(Step(
+            name="init",
+            agent=init_agent,
+            input_fn=lambda ctx: "start",
+            output_fn=lambda ctx, out: ctx.set("init", out),
+        ))
+        engine.add_parallel(ParallelGroup(
+            name="parallel",
+            steps=[
+                Step("p1", p1, lambda ctx: "a", lambda ctx, o: ctx.set("p1", o)),
+                Step("p2", p2, lambda ctx: "b", lambda ctx, o: ctx.set("p2", o)),
+            ],
+        ))
+        engine.add_step(Step(
+            name="final",
+            agent=final,
+            input_fn=lambda ctx: f"{ctx.get('p1')},{ctx.get('p2')}",
+            output_fn=lambda ctx, out: ctx.set("final", out),
+        ))
+
+        ctx = engine.run(ctx)
+
+        assert ctx.get("init") == "init"
+        assert ctx.get("p1") == "p1"
+        assert ctx.get("p2") == "p2"
+        assert ctx.get("final") == "done"
+
+    def test_parallel_with_condition(self):
+        """测试并行步骤中的条件过滤"""
+        agent1 = MockAgent(responses=["r1"])
+        agent2 = MockAgent(responses=["r2"])
+
+        ctx = WorkflowContext({"skip_b": True})
+        engine = WorkflowEngine(verbose=False)
+
+        engine.add_parallel(ParallelGroup(
+            name="conditional-parallel",
+            steps=[
+                Step("A", agent1, lambda ctx: "a", lambda ctx, o: ctx.set("a", o)),
+                Step("B", agent2, lambda ctx: "b", lambda ctx, o: ctx.set("b", o),
+                     condition=lambda ctx: not ctx.get("skip_b", False)),
+            ],
+        ))
+
+        ctx = engine.run(ctx)
+
+        assert ctx.get("a") == "r1"
+        # B 被跳过，output_fn 未被调用
+        assert ctx.get("b") is None

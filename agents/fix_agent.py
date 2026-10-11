@@ -1,12 +1,20 @@
 """
 修复 Agent
 负责根据审查报告修复代码中的问题
-不使用工具，纯粹依赖 LLM 的代码修复能力
+绑定 read_file/execute_python 工具，可读取原始代码并验证修复结果
 """
 
 from agents.base import BaseAgent
+from tools import CODE_TOOLS
 
 FIX_SYSTEM_PROMPT = """你是一个专业的代码修复专家（Fix Agent），负责根据审查报告修复代码中的问题。
+
+## 你的能力
+
+1. **读取文件**：使用 `read_file` 工具读取原始代码文件
+2. **执行代码**：使用 `execute_python` 工具运行测试验证修复结果
+3. **搜索代码**：使用 `search_code` 工具查找相关引用
+4. **代码修复**：基于 LLM 能力生成修复代码
 
 ## 你的职责
 
@@ -17,10 +25,12 @@ FIX_SYSTEM_PROMPT = """你是一个专业的代码修复专家（Fix Agent），
 
 ## 修复流程
 
-1. 分析审查报告中的问题列表
-2. 按优先级修复（critical > warning > info）
-3. 每个修复说明改了什么、为什么这样改
-4. 输出完整的修复后代码
+1. 如果需要查看原始文件，使用 `read_file` 工具
+2. 分析审查报告中的问题列表
+3. 按优先级修复（critical > warning > info）
+4. 每个修复说明改了什么、为什么这样改
+5. 输出完整的修复后代码
+6. 如果可以运行测试验证，使用 `execute_python` 工具
 
 ## 输出格式
 
@@ -57,10 +67,11 @@ FIX_SYSTEM_PROMPT = """你是一个专业的代码修复专家（Fix Agent），
 class FixAgent(BaseAgent):
     """修复 Agent
 
-    根据审查报告修复代码问题，输出修复后的完整代码
-    不使用工具，纯 LLM 修复
+    根据审查报告修复代码问题，输出修复后的完整代码。
+    绑定 read_file/execute_python 工具，可读取原始代码并运行测试验证修复。
+    支持通过构造函数传入自定义 system_prompt 和 tools。
     """
 
     name = "FixAgent"
-    system_prompt = FIX_SYSTEM_PROMPT
-    tools = []
+    default_system_prompt = FIX_SYSTEM_PROMPT
+    default_tools = CODE_TOOLS

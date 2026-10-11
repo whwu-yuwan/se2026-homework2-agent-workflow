@@ -1,200 +1,204 @@
-# 📐 设计文档 - 代码审查工作流
+# 📐 设计文档 - 多 Agent 协同工作流系统
 
 ## 1. 架构概述
 
-### 1.1 系统架构
+### 1.1 系统架构图
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                           用户 (CLI)                                 │
-│                              │                                       │
-│                              ▼                                       │
-│                      ┌──────────────┐                                │
-│                      │   main.py    │  CLI 交互界面                   │
-│                      └──────┬───────┘                                │
-│                             │                                        │
-│                             ▼                                        │
-│               ┌──────────────────────────┐                          │
-│               │    WorkflowEngine         │  工作流引擎               │
-│               │  - 顺序执行               │                          │
-│               │  - 条件分支               │                          │
-│               │  - 循环控制               │                          │
-│               │  - 错误恢复               │                          │
-│               └───────────┬──────────────┘                          │
-│                           │                                          │
-│        ┌──────────────────┼──────────────────┐                      │
-│        ▼                  ▼                  ▼                      │
-│ ┌──────────────┐  ┌──────────────┐  ┌──────────────┐               │
-│ │  CodeAgent   │  │ ReviewAgent  │  │   FixAgent   │               │
-│ │  (读取代码)   │  │  (审查分析)   │  │  (修复代码)   │               │
-│ └──────┬───────┘  └──────────────┘  └──────────────┘               │
-│        │                                                            │
-│        ▼                                                            │
-│ ┌──────────────┐  ┌──────────────┐                                │
-│ │   tools.py   │  │   BaseAgent  │  Agent 基类                     │
-│ │  (文件工具)   │  │  (消息管理)   │                                │
-│ └──────────────┘  └──────────────┘                                │
-│                                                                    │
-│ ┌──────────────────────────────────────┐                          │
-│ │           WorkflowContext             │  共享状态                 │
-│ │  - code: 当前代码                     │                          │
-│ │  - review_result: 审查报告            │                          │
-│ │  - review_round: 当前轮次             │                          │
-│ │  - has_critical_issues: 是否有问题    │                          │
-│ └──────────────────────────────────────┘                          │
-│                                                                    │
-│  DeepSeek API (via langchain-openai)                               │
-└─────────────────────────────────────────────────────────────────────┘
+```mermaid
+graph TB
+    User["👤 用户 (CLI)"] --> Main["main.py<br/>CLI 交互界面"]
+    Main --> Engine["WorkflowEngine<br/>工作流引擎"]
+    
+    Engine --> Step["Step<br/>顺序步骤"]
+    Engine --> Loop["LoopGroup<br/>循环组"]
+    Engine --> Parallel["ParallelGroup<br/>并行组"]
+    
+    Step --> Agent["BaseAgent"]
+    Loop --> Agent
+    Parallel --> Agent
+    
+    Agent --> CodeAgent["CodeAgent<br/>读取代码"]
+    Agent --> ReviewAgent["ReviewAgent<br/>审查/分析"]
+    Agent --> FixAgent["FixAgent<br/>修复/生成"]
+    
+    Agent --> Context["WorkflowContext<br/>共享状态"]
+    Agent --> Tools["tools.py<br/>文件工具"]
+    Agent --> LLM["DeepSeek API"]
+    
+    Engine --> Logger["FlowLogger<br/>执行日志"]
 ```
 
 ### 1.2 组件职责
 
 | 组件 | 文件 | 职责 |
 |------|------|------|
-| CLI 界面 | `main.py` | 命令行交互、命令处理 |
-| 工作流引擎 | `workflow/engine.py` | 步骤编排、条件分支、循环控制、错误恢复 |
+| CLI 界面 | `main.py` | 命令行交互、多工作流选择、命令处理 |
+| 工作流引擎 | `workflow/engine.py` | 步骤编排、条件分支、循环控制、并行执行 |
 | 共享上下文 | `workflow/context.py` | Agent 间数据传递、状态记录 |
 | 执行日志 | `workflow/flow_logger.py` | 实时打印、执行摘要 |
-| Agent 基类 | `agents/base.py` | LLM 调用、消息管理、上下文裁剪 |
+| Agent 基类 | `agents/base.py` | LLM 调用、消息管理、上下文裁剪、可配置 prompt/tools |
 | 编码 Agent | `agents/code_agent.py` | 读取代码文件、理解代码结构 |
-| 审查 Agent | `agents/review_agent.py` | 分析代码质量、发现问题 |
-| 修复 Agent | `agents/fix_agent.py` | 根据审查报告修复代码 |
-| 工具集 | `tools.py` | 文件读取、目录浏览、代码搜索 |
-| 工作流定义 | `workflows/code_review.py` | 代码审查工作流的具体编排 |
+| 审查 Agent | `agents/review_agent.py` | 分析代码质量、可主动查阅文件 |
+| 修复 Agent | `agents/fix_agent.py` | 修复代码、可执行测试验证 |
+| Agent 注册表 | `agents/registry.py` | Agent 注册与发现，支持动态创建 |
+| 工具集 | `tools.py` | 文件读取、目录浏览、代码搜索、代码执行 |
 
 ## 2. 工作流引擎设计
 
 ### 2.1 核心抽象
 
-```python
-# Step: 单个工作流步骤
-Step(
-    name="步骤名称",
-    agent=某个Agent实例,
-    input_fn=lambda ctx: "从上下文提取输入",
-    output_fn=lambda ctx, output: ctx.set("key", output),
-    condition=lambda ctx: True/False  # 可选的执行条件
-)
-
-# LoopGroup: 循环步骤组
-LoopGroup(
-    name="循环名称",
-    steps=[Step, Step, ...],
-    condition=lambda ctx: True继续/False停止,
-    max_rounds=3
-)
+```mermaid
+classDiagram
+    class WorkflowEngine {
+        +add_step(Step)
+        +add_loop(LoopGroup)
+        +add_parallel(ParallelGroup)
+        +run(WorkflowContext)
+    }
+    class Step {
+        +name: str
+        +agent: BaseAgent
+        +input_fn: Callable
+        +output_fn: Callable
+        +condition: Callable
+    }
+    class LoopGroup {
+        +name: str
+        +steps: List~Step~
+        +condition: Callable
+        +max_rounds: int
+    }
+    class ParallelGroup {
+        +name: str
+        +steps: List~Step~
+        +max_workers: int
+    }
+    WorkflowEngine --> Step
+    WorkflowEngine --> LoopGroup
+    WorkflowEngine --> ParallelGroup
+    Step --> BaseAgent
 ```
 
-### 2.2 执行流程
+### 2.2 执行流程（代码审查工作流）
 
-```
-用户输入
-    │
-    ▼
-┌─────────────────────────────────┐
-│  Step 1: CodeAgent 读取代码      │
-│  input: 用户输入                  │
-│  output: ctx.code = 代码内容      │
-└──────────────┬──────────────────┘
-               │
-               ▼
-┌─────────────────────────────────┐
-│  LoopGroup: 审查-修复循环         │
-│  max_rounds: 3                   │
-│                                  │
-│  ┌────────────────────────────┐ │
-│  │ Step 2: ReviewAgent 审查    │ │
-│  │ input: ctx.code             │ │
-│  │ output: ctx.review_result   │ │
-│  │       ctx.has_critical_issues│ │
-│  └────────────┬───────────────┘ │
-│               │                  │
-│         有问题? ──否──→ 退出循环  │
-│               │是                │
-│               ▼                  │
-│  ┌────────────────────────────┐ │
-│  │ Step 3: FixAgent 修复       │ │
-│  │ condition: has_critical_issues│ │
-│  │ input: code + review_result │ │
-│  │ output: ctx.code = 修复后   │ │
-│  └────────────────────────────┘ │
-│               │                  │
-│          回到 Step 2             │
-└──────────────┬──────────────────┘
-               │
-               ▼
-         输出最终结果
+```mermaid
+flowchart TD
+    A["用户输入代码/文件路径"] --> B["Step 1: CodeAgent 读取代码"]
+    B --> C["LoopGroup: 审查-修复循环"]
+    
+    subgraph Loop["循环（最多3轮）"]
+        C --> D["Step 2: ReviewAgent 审查"]
+        D --> E{发现严重问题?}
+        E -- 是 --> F["Step 3: FixAgent 修复"]
+        F --> C
+        E -- 否 --> G["退出循环"]
+    end
+    
+    G --> H["输出最终结果"]
 ```
 
-### 2.3 关键设计决策
+### 2.3 执行流程（文档生成工作流）
 
-1. **Step 抽象**：每个步骤通过 `input_fn` 和 `output_fn` 与上下文交互，解耦 Agent 与工作流逻辑
+```mermaid
+flowchart TD
+    A["用户输入代码/文件路径"] --> B["Step 1: CodeAgent 读取代码"]
+    B --> C["Step 2: ReviewAgent 分析代码结构"]
+    C --> D["Step 3: FixAgent 生成文档"]
+    D --> E["输出 README.md"]
+```
+
+### 2.4 关键设计决策
+
+1. **Step 抽象**：通过 `input_fn`/`output_fn` 与上下文交互，解耦 Agent 与工作流逻辑
 2. **条件执行**：Step.condition 控制单步是否执行，LoopGroup.condition 控制循环是否继续
-3. **最大轮次**：防止无限循环，默认 3 轮
-4. **结论解析**：从审查报告中解析 `PASS/NEEDS_FIX` 结论，驱动循环条件
-5. **错误隔离**：单步失败可通过配置决定是否中断整个流程
+3. **并行执行**：ParallelGroup 使用 `ThreadPoolExecutor` 并发执行独立任务
+4. **最大轮次**：防止无限循环，默认 3 轮
+5. **通用轮次计数**：`ctx.set(f"{loop.name}_round", n)` 避免硬编码业务字段
 
 ## 3. Agent 设计
 
 ### 3.1 Agent 层次结构
 
-```
-BaseAgent (基类)
-├── LLM 初始化
-├── 消息管理 (SystemMessage, HumanMessage, AIMessage, ToolMessage)
-├── 上下文裁剪 (tiktoken 估算)
-├── 工具执行
-└── run() 方法: Agent 循环
-
-CodeAgent (继承 BaseAgent)
-├── name = "CodeAgent"
-├── system_prompt = 代码分析专家
-└── tools = [read_file, list_directory, search_code]
-
-ReviewAgent (继承 BaseAgent)
-├── name = "ReviewAgent"
-├── system_prompt = 代码审查专家
-└── tools = []  (纯 LLM 分析)
-
-FixAgent (继承 BaseAgent)
-├── name = "FixAgent"
-├── system_prompt = 代码修复专家
-└── tools = []  (纯 LLM 修复)
-```
-
-### 3.2 Agent 通信方式
-
-Agent 之间通过 **WorkflowContext** 间接通信：
-
-```
-CodeAgent.run(输入) → 输出 → ctx.code = 输出
-                                ↓
-ReviewAgent.run(ctx.code) → 输出 → ctx.review_result = 输出
-                                       ↓
-FixAgent.run(ctx.code + ctx.review_result) → 输出 → ctx.code = 修复后代码
-                                                        ↓
-                                                   回到 ReviewAgent
+```mermaid
+classDiagram
+    class BaseAgent {
+        +name: str
+        +system_prompt: str
+        +tools: List
+        +run(user_input: str) str
+        +reset()
+        -_trim_context()
+        -_execute_tool_calls()
+    }
+    class CodeAgent {
+        +default_system_prompt = 代码分析专家
+        +default_tools = READ_TOOLS
+    }
+    class ReviewAgent {
+        +default_system_prompt = 代码审查专家
+        +default_tools = READ_TOOLS
+    }
+    class FixAgent {
+        +default_system_prompt = 代码修复专家
+        +default_tools = CODE_TOOLS
+    }
+    BaseAgent <|-- CodeAgent
+    BaseAgent <|-- ReviewAgent
+    BaseAgent <|-- FixAgent
 ```
 
-### 3.3 BaseAgent.run() 流程
+### 3.2 Agent 工具分配
 
+| Agent | 工具 | 设计理由 |
+|-------|------|----------|
+| CodeAgent | read_file, list_directory, search_code | 需要遍历项目结构、读取多个文件 |
+| ReviewAgent | read_file, list_directory, search_code | 审查时需查阅依赖文件、搜索引用 |
+| FixAgent | read_file, list_directory, search_code, execute_python | 修复后可运行测试验证 |
+
+### 3.3 Agent 通信方式
+
+Agent 通过 **WorkflowContext** 间接通信，支持两种模式：
+
+- **单向流水线**：A 输出 → ctx → B 输入（当前实现）
+- **反馈循环**：通过 LoopGroup 实现 A → B → 判断 → A 的循环审查
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant C as CodeAgent
+    participant R as ReviewAgent
+    participant F as FixAgent
+    participant CTX as WorkflowContext
+
+    U->>CTX: user_input
+    CTX->>C: 读取代码
+    C->>CTX: code
+    
+    loop 审查-修复循环
+        CTX->>R: code
+        R->>CTX: review_result
+        alt 有问题
+            CTX->>F: code + review_result
+            F->>CTX: 修复后 code
+        end
+    end
+    
+    CTX->>U: 最终结果
 ```
-输入校验 (token 长度)
-    │
-    ▼
-添加 HumanMessage 到历史
-    │
-    ▼
-上下文裁剪
-    │
-    ▼
-Agent 循环 (最多 MAX_TOOL_CALLS_PER_TURN 次)
-    │
-    ├── 有工具调用 → 执行工具 → 结果加入历史 → 继续循环
-    │
-    ├── 无工具调用 → 返回文本回复
-    │
-    └── 轮次耗尽 → 强制生成回复
+
+### 3.4 可配置 System Prompt
+
+Agent 支持通过构造函数传入自定义 `system_prompt` 和 `tools`：
+
+```python
+# 使用默认配置
+agent = ReviewAgent()
+
+# 自定义审查标准
+agent = ReviewAgent(system_prompt="请按照 PEP8 标准审查代码...")
+
+# 自定义工具集
+agent = FixAgent(tools=[read_file, execute_python])
 ```
 
 ## 4. 共享状态设计 (WorkflowContext)
@@ -203,55 +207,78 @@ Agent 循环 (最多 MAX_TOOL_CALLS_PER_TURN 次)
 
 ```python
 class WorkflowContext:
-    _data: Dict[str, Any]       # 通用键值对存储
+    _data: Dict[str, Any]       # 通用键值对存储（无模式）
     _step_results: List[Step]   # 步骤执行记录
-    _start_time: float          # 开始时间
     _status: str                # pending | running | completed | failed
-
-    # 便捷属性
-    code: str                   # 当前代码
-    review_result: str          # 审查报告
-    review_round: int           # 当前审查轮次
-    has_critical_issues: bool   # 是否有严重问题
 ```
 
 ### 4.2 数据流向
 
-```
-Step 1 (CodeAgent):
-  输入: ctx["user_input"]
-  输出: ctx["code"] = CodeAgent 输出
-
-Step 2 (ReviewAgent):
-  输入: ctx["code"]
-  输出: ctx["review_result"] = 审查报告
-        ctx["has_critical_issues"] = True/False
-
-Step 3 (FixAgent):
-  输入: ctx["code"] + ctx["review_result"]
-  输出: ctx["code"] = 修复后代码（覆盖原代码）
-
-下一轮 Step 2:
-  输入: ctx["code"]（修复后的代码）
-  ...
+```mermaid
+flowchart LR
+    A["Step 1 输出"] -->|ctx.set('code', output)| B["WorkflowContext"]
+    B -->|ctx.get('code')| C["Step 2 输入"]
+    C -->|ctx.set('review_result', output)| B
+    B -->|ctx.get('code') + ctx.get('review_result')| D["Step 3 输入"]
+    D -->|ctx.set('code', fixed)| B
 ```
 
-## 5. 异常处理
+## 5. Agent 注册机制
 
-### 5.1 异常类层次
-
-```
-WorkflowError (工作流基础异常)
-├── AgentError (Agent 基础异常)
-│   ├── ToolError    — 工具执行失败
-│   ├── APIError     — LLM 调用失败
-│   └── ContextError — 输入过长
-├── ConfigError      — 配置错误
-├── EngineError      — 引擎错误
-└── StepError        — 步骤执行失败
+```mermaid
+flowchart LR
+    Registry["AgentRegistry"] -->|"create('CodeAgent')"| A["CodeAgent 实例"]
+    Registry -->|"create('ReviewAgent')"| B["ReviewAgent 实例"]
+    Registry -->|"create('FixAgent')"| C["FixAgent 实例"]
+    
+    WF["工作流定义"] -->|"default_registry.create(...)"| Registry
 ```
 
-### 5.2 错误处理策略
+使用注册表的好处：
+- 新增 Agent 只需 `registry.register(NewAgent)`，无需修改工作流代码
+- 支持运行时动态选择 Agent
+- 工作流定义与 Agent 实现解耦
+
+## 6. 异常处理
+
+### 6.1 异常类层次
+
+```mermaid
+classDiagram
+    class WorkflowError {
+        <<工作流基础异常>>
+    }
+    class AgentError {
+        <<Agent 基础异常>>
+    }
+    class ToolError {
+        <<工具执行失败>>
+    }
+    class APIError {
+        <<LLM 调用失败>>
+    }
+    class ContextError {
+        <<输入过长>>
+    }
+    class ConfigError {
+        <<配置错误>>
+    }
+    class EngineError {
+        <<引擎错误>>
+    }
+    class StepError {
+        <<步骤执行失败>>
+    }
+    WorkflowError <|-- AgentError
+    WorkflowError <|-- ConfigError
+    WorkflowError <|-- EngineError
+    WorkflowError <|-- StepError
+    AgentError <|-- ToolError
+    AgentError <|-- APIError
+    AgentError <|-- ContextError
+```
+
+### 6.2 错误处理策略
 
 | 场景 | 处理方式 |
 |------|----------|
@@ -260,65 +287,88 @@ WorkflowError (工作流基础异常)
 | 工具执行失败 | 工具内部 raise ToolError，Agent 转为 ToolMessage |
 | 步骤执行失败 | Engine 捕获，记录到执行日志，raise EngineError |
 | 循环超过最大轮次 | 自动退出循环，输出当前结果 |
-| 用户中断 (Ctrl+C) | 优雅退出 |
+| 并行步骤部分失败 | 记录失败步骤，不影响其他步骤 |
 
-## 6. 可扩展性设计
+## 7. 可扩展性设计
 
-### 6.1 新增 Agent
+### 7.1 新增 Agent
 
 ```python
 # 1. 继承 BaseAgent
 class TestAgent(BaseAgent):
     name = "TestAgent"
-    system_prompt = "..."
-    tools = [...]
+    default_system_prompt = "..."
+    default_tools = [...]
 
-# 2. 在工作流中注册
-engine.add_step(Step(
-    name="测试步骤",
-    agent=TestAgent(),
-    input_fn=lambda ctx: ...,
-    output_fn=lambda ctx, output: ...,
-))
+# 2. 注册到注册表
+default_registry.register(TestAgent)
+
+# 3. 在工作流中使用
+agent = default_registry.create("TestAgent")
 ```
 
-### 6.2 新增工作流
+### 7.2 新增工作流
 
 ```python
-# 定义新的工作流
 def build_test_workflow() -> WorkflowEngine:
     engine = WorkflowEngine(name="测试工作流")
     engine.add_step(Step(...))
     engine.add_loop(LoopGroup(...))
+    engine.add_parallel(ParallelGroup(...))
     return engine
 ```
 
-### 6.3 新增工具
+### 7.3 并行步骤
 
 ```python
-# 在 tools.py 中定义
-@tool
-def new_tool(param: str) -> str:
-    """工具描述"""
-    ...
-
-# 绑定到 Agent
-class MyAgent(BaseAgent):
-    tools = [read_file, new_tool]
+engine.add_parallel(ParallelGroup(
+    name="多文件审查",
+    steps=[
+        Step("审查文件A", agent, ...),
+        Step("审查文件B", agent, ...),
+    ],
+    max_workers=4,
+))
 ```
 
-## 7. 测试策略
+## 8. 已知限制与未来改进
 
-### 7.1 测试覆盖
+### 当前限制
 
-| 测试类型 | 文件 | 覆盖范围 |
-|----------|------|----------|
-| 引擎测试 | `test_engine.py` | Step 执行、条件分支、循环控制、错误处理 |
-| Agent 测试 | `test_agents.py` | Agent 初始化、消息管理、工具执行 |
-| 工作流测试 | `test_workflow.py` | 端到端流程、上下文数据流、审查结论解析 |
+1. **Agent 间无直接通信**：当前是单向数据流（流水线模式），Agent 无法向其他 Agent 追问或协商。LoopGroup 提供了间接反馈循环，但不是真正的 Agent 间对话。
 
-### 7.2 测试方法
+2. **并行步骤共享上下文**：并行步骤写入同一个 WorkflowContext，如果多个步骤写入相同 key 可能产生竞态。适用于写入不同 key 的独立任务。
 
-- **Mock LLM**：使用 `unittest.mock.patch` 模拟 Agent.run()
+3. **System Prompt 硬编码为默认值**：虽然支持构造函数覆盖，但默认 prompt 仍以字符串常量定义在代码中，非配置文件驱动。
+
+4. **单用户 CLI 场景**：当前设计面向单用户命令行使用，未考虑多用户并发或 Web 服务场景。
+
+### 未来改进方向
+
+1. **Agent 间直接通信**：引入消息总线或请求-响应机制，允许 Agent 互相追问
+2. **配置驱动工作流**：通过 YAML/JSON 定义工作流，无需写 Python 代码
+3. **持久化状态**：支持工作流断点续跑、执行历史持久化
+4. **可视化编排界面**：拖拽式工作流设计器
+5. **并行步骤安全写入**：为每个并行步骤提供独立的上下文副本，合并后写入主上下文
+
+## 9. 测试策略
+
+### 9.1 测试覆盖
+
+| 测试文件 | 用例数 | 覆盖范围 |
+|----------|--------|----------|
+| test_tools.py | 22 | 4 个工具的功能和边界 |
+| test_agents.py | 30 | Agent 初始化、run() 循环、工具调用、裁剪 |
+| test_engine.py | 29 | 引擎编排、条件分支、循环、并行 |
+| test_workflow.py | 15 | 结论解析、端到端集成、文档生成 |
+| test_flow_logger.py | 17 | 执行日志全流程 |
+| test_main.py | 13 | CLI 命令处理、工作流配置 |
+| test_registry.py | 7 | Agent 注册与发现 |
+| **合计** | **138** | |
+
+### 9.2 测试方法
+
+- **Mock LLM**：使用 `unittest.mock.patch` 模拟 ChatOpenAI
 - **Mock Agent**：验证工作流引擎的编排逻辑
-- **上下文测试**：验证数据在 Agent 间正确传递
+- **Mock Registry**：隔离工作流定义与 Agent 实现
+- **临时文件**：使用 pytest `tmp_path` fixture 测试工具

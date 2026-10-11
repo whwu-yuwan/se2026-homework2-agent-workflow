@@ -1,12 +1,30 @@
 """
 测试配置
-提供通用的测试 fixtures
+提供通用的测试 fixtures，处理 langchain 兼容性问题
 """
 
+import sys
+import types
 import pytest
 from unittest.mock import MagicMock
 
-# 设置允许所有路径（测试环境）
+# ─── langchain 兼容性修复 ─────────────────────────────────────
+# langchain-core 的 globals.py 会访问 langchain.verbose / langchain.debug
+# 但新版 langchain 包可能没有这些属性，需要提前补上
+if "langchain" in sys.modules:
+    _lc = sys.modules["langchain"]
+    if not hasattr(_lc, "verbose"):
+        _lc.verbose = False
+    if not hasattr(_lc, "debug"):
+        _lc.debug = False
+else:
+    # 如果 langchain 还没被 import，创建一个假模块占位
+    _fake_lc = types.ModuleType("langchain")
+    _fake_lc.verbose = False
+    _fake_lc.debug = False
+    sys.modules["langchain"] = _fake_lc
+
+# ─── 测试环境配置 ─────────────────────────────────────────────
 import config
 config.ALLOWED_PATH_PREFIX = "/"
 config.API_KEY = "test-key"

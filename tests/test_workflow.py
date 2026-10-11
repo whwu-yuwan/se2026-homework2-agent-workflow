@@ -103,3 +103,107 @@ class TestWorkflowBuild:
         # 应该有 1 个步骤（读取代码）和 1 个循环组（审查-修复）
         assert len(engine._steps) == 1
         assert len(engine._loop_groups) == 1
+
+
+class TestEndToEndWorkflow:
+    """端到端工作流集成测试（Mock Agent）"""
+
+    def _make_mock_agent(self, name, responses):
+        """创建一个模拟 Agent"""
+        from unittest.mock import MagicMock
+        agent = MagicMock()
+        agent.name = name
+        agent._responses = list(responses)
+        agent._call_count = 0
+
+        def side_effect(user_input):
+            if agent._call_count < len(agent._responses):
+                resp = agent._responses[agent._call_count]
+            else:
+                resp = agent._responses[-1]
+            agent._call_count += 1
+            return resp
+
+        agent.run = side_effect
+        return agent
+
+    @patch("workflows.code_review.CodeAgent")
+    @patch("workflows.code_review.ReviewAgent")
+    @patch("workflows.code_review.FixAgent")
+    def test_pass_first_round(self, MockFix, MockReview, MockCode):
+        """测试第一轮审查就通过（无需修复）"""
+        from workflows.code_review import build_code_review_workflow
+
+        code_agent = self._make_mock_agent("CodeAgent", ["def hello(): pass"])
+        review_agent = self._make_mock_agent("ReviewAgent", ["代码良好\n\nPASS"])
+        fix_agent = self._make_mock_agent("FixAgent", ["should not run"])
+
+        MockCode.return_value = code_agent
+        MockReview.return_value = review_agent
+        MockFix.return_value = fix_agent
+
+        ctx = WorkflowContext({"user_input": "test.py"})
+        engine = build_code_review_workflow(verbose=False)
+        ctx = engine.run(ctx)
+
+        assert ctx.status == "completed"
+        assert ctx.code == "def hello(): pass"  # 代码未被修改
+        assert ctx.has_critical_issues is False
+
+    @patch("workflows.code_review.CodeAgent")
+    @patch("workflows.code_review.ReviewAgent")
+    @patch("workflows.code_review.FixAgent")
+    def test_fix_then_pass(self, MockFix, MockReview, MockCode):
+        """测试第一轮有问题，修复后通过"""
+        from workflows.code_review import build_code_review_workflow
+
+        code_agent = self._make_mock_agent("CodeAgent", ["def div(a,b): return a/b"])
+        review_agent = self._make_mock_agent("ReviewAgent", [
+            "发现除零风险\n\nNEEDS_FIX",  # 第一轮
+            "修复后代码良好\n\nPASS",       # 第二轮
+        ])
+        fix_agent = self._make_mock_agent("FixAgent", [
+            "def div(a,b):\n    if b==0: raise ValueError\n    return a/b"
+        ])
+
+        MockCode.return_value = code_agent
+        MockReview.return_value = review_agent
+        MockFix.return_value = fix_agent
+
+        ctx = WorkflowContext({"user_input": "test.py"})
+        engine = build_code_review_workflow(verbose=False)
+        ctx = engine.run(ctx)
+
+        assert ctx.status == "completed"
+        assert "ValueError" in ctx.code  # 代码被修复
+        assert ctx.review_round == 2
+
+    @patch("workflows.code_review.CodeAgent")
+    @patch("workflows.code_review.ReviewAgent")
+    @patch("workflows.code_review.FixAgent")
+    def test_max_rounds_reached(self, MockFix, MockReview, MockCode):
+        """测试达到最大循环轮次"""
+        import config as cfg
+        from workflows.code_review import build_code_review_workflow
+
+        code_agent = self._make_mock_agent("CodeAgent", ["buggy code"])
+        # 每轮都有问题
+        review_agent = self._make_mock_agent("ReviewAgent", [
+            "问题1\n\nNEEDS_FIX",
+            "问题2\n\nNEEDS_FIX",
+            "问题3\n\nNEEDS_FIX",
+        ])
+        fix_agent = self._make_mock_agent("FixAgent", [
+            "fix1", "fix2", "fix3"
+        ])
+
+        MockCode.return_value = code_agent
+        MockReview.return_value = review_agent
+        MockFix.return_value = fix_agent
+
+        ctx = WorkflowContext({"user_input": "test.py"})
+        engine = build_code_review_workflow(verbose=False)
+        ctx = engine.run(ctx)
+
+        assert ctx.status == "completed"
+        assert ctx.review_round == cfg.MAX_REVIEW_ROUNDS

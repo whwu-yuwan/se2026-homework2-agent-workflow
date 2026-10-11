@@ -342,3 +342,233 @@ class TestWorkflowContext:
         assert ctx.review_result == "PASS"
         assert ctx.review_round == 2
         assert not ctx.has_critical_issues
+
+
+class TestMixedExecution:
+    """测试混合编排（步骤 + 循环组合）"""
+
+    def test_step_then_loop(self):
+        """测试先执行步骤，再执行循环"""
+        init_agent = MockAgent(responses=["initialized data"])
+        process_agent = MockAgent(responses=["PASS"])
+
+        ctx = WorkflowContext()
+        engine = WorkflowEngine(verbose=False)
+
+        engine.add_step(Step(
+            name="init",
+            agent=init_agent,
+            input_fn=lambda ctx: "init",
+            output_fn=lambda ctx, out: ctx.set("data", out),
+        ))
+        engine.add_loop(LoopGroup(
+            name="process-loop",
+            steps=[Step(
+                name="process",
+                agent=process_agent,
+                input_fn=lambda ctx: ctx.get("data"),
+                output_fn=lambda ctx, out: ctx.set("done", True),
+            )],
+            condition=lambda ctx: False,
+            max_rounds=3,
+        ))
+
+        ctx = engine.run(ctx)
+        assert ctx.get("data") == "initialized data"
+        assert ctx.status == "completed"
+
+    def test_loop_then_step(self):
+        """测试先执行循环，再执行步骤"""
+        review_agent = MockAgent(responses=["PASS"])
+        output_agent = MockAgent(responses=["final output"])
+
+        ctx = WorkflowContext({"code": "test code"})
+        engine = WorkflowEngine(verbose=False)
+
+        engine.add_loop(LoopGroup(
+            name="review",
+            steps=[Step(
+                name="review",
+                agent=review_agent,
+                input_fn=lambda ctx: ctx.get("code"),
+                output_fn=lambda ctx, out: ctx.set("reviewed", True),
+            )],
+            condition=lambda ctx: False,
+            max_rounds=1,
+        ))
+        engine.add_step(Step(
+            name="output",
+            agent=output_agent,
+            input_fn=lambda ctx: "generate report",
+            output_fn=lambda ctx, out: ctx.set("report", out),
+        ))
+
+        ctx = engine.run(ctx)
+        assert ctx.get("reviewed") is True
+        assert ctx.get("report") == "final output"
+
+    def test_multiple_loops(self):
+        """测试多个循环组"""
+        agent1 = MockAgent(responses=["loop1 done"])
+        agent2 = MockAgent(responses=["loop2 done"])
+
+        ctx = WorkflowContext()
+        engine = WorkflowEngine(verbose=False)
+
+        engine.add_loop(LoopGroup(
+            name="loop1",
+            steps=[Step(
+                name="step1",
+                agent=agent1,
+                input_fn=lambda ctx: "input1",
+                output_fn=lambda ctx, out: ctx.set("r1", out),
+            )],
+            condition=lambda ctx: False,
+            max_rounds=1,
+        ))
+        engine.add_loop(LoopGroup(
+            name="loop2",
+            steps=[Step(
+                name="step2",
+                agent=agent2,
+                input_fn=lambda ctx: "input2",
+                output_fn=lambda ctx, out: ctx.set("r2", out),
+            )],
+            condition=lambda ctx: False,
+            max_rounds=1,
+        ))
+
+        ctx = engine.run(ctx)
+        assert ctx.get("r1") == "loop1 done"
+        assert ctx.get("r2") == "loop2 done"
+
+    def test_step_then_loop_then_step(self):
+        """测试 步骤 → 循环 → 步骤 完整编排"""
+        agent_a = MockAgent(responses=["step A"])
+        agent_b = MockAgent(responses=["PASS"])
+        agent_c = MockAgent(responses=["step C"])
+
+        ctx = WorkflowContext()
+        engine = WorkflowEngine(verbose=False)
+
+        engine.add_step(Step(
+            name="A",
+            agent=agent_a,
+            input_fn=lambda ctx: "start",
+            output_fn=lambda ctx, out: ctx.set("a", out),
+        ))
+        engine.add_loop(LoopGroup(
+            name="B-loop",
+            steps=[Step(
+                name="B",
+                agent=agent_b,
+                input_fn=lambda ctx: ctx.get("a"),
+                output_fn=lambda ctx, out: ctx.set("b", out),
+            )],
+            condition=lambda ctx: False,
+            max_rounds=1,
+        ))
+        engine.add_step(Step(
+            name="C",
+            agent=agent_c,
+            input_fn=lambda ctx: ctx.get("b"),
+            output_fn=lambda ctx, out: ctx.set("c", out),
+        ))
+
+        ctx = engine.run(ctx)
+        assert ctx.get("a") == "step A"
+        assert ctx.get("b") == "PASS"
+        assert ctx.get("c") == "step C"
+
+    def test_loop_with_conditional_inner_step(self):
+        """测试循环内有条件执行的步骤"""
+        review_agent = MockAgent(responses=["NEEDS_FIX", "PASS"])
+        fix_agent = MockAgent(responses=["fixed code"])
+
+        ctx = WorkflowContext({"code": "buggy code"})
+        engine = WorkflowEngine(verbose=False)
+
+        round_count = [0]
+
+        def review_output(ctx, output):
+            ctx.set("issues", "NEEDS_FIX" in output)
+            round_count[0] += 1
+
+        engine.add_loop(LoopGroup(
+            name="review-fix",
+            steps=[
+                Step(
+                    name="review",
+                    agent=review_agent,
+                    input_fn=lambda ctx: ctx.get("code"),
+                    output_fn=review_output,
+                ),
+                Step(
+                    name="fix",
+                    agent=fix_agent,
+                    input_fn=lambda ctx: ctx.get("code"),
+                    output_fn=lambda ctx, out: ctx.set("code", out),
+                    condition=lambda ctx: ctx.get("issues", False),
+                ),
+            ],
+            condition=lambda ctx: ctx.get("issues", False),
+            max_rounds=3,
+        ))
+
+        ctx = engine.run(ctx)
+        assert ctx.status == "completed"
+        assert round_count[0] == 2
+
+    def test_engine_name(self):
+        """测试引擎名称"""
+        engine = WorkflowEngine(name="my workflow", verbose=False)
+        assert engine.name == "my workflow"
+
+    def test_flow_logger_property(self):
+        """测试 flow_logger 属性"""
+        engine = WorkflowEngine(verbose=False)
+        assert engine.flow_logger is not None
+
+    def test_step_result_metadata(self):
+        """测试步骤结果包含元数据"""
+        class FailingAgent:
+            name = "FailAgent"
+            def run(self, input):
+                raise ValueError("test error")
+
+        ctx = WorkflowContext()
+        engine = WorkflowEngine(verbose=False)
+        engine.add_step(Step(
+            name="fail_step",
+            agent=FailingAgent(),
+            input_fn=lambda ctx: "input",
+            output_fn=lambda ctx, out: None,
+        ))
+
+        with pytest.raises(EngineError):
+            engine.run(ctx)
+
+        result = ctx.step_results[0]
+        assert result.status == "failed"
+        assert result.metadata["error_type"] == "ValueError"
+
+    def test_data_flow_through_multiple_steps(self):
+        """测试数据在多个步骤间正确流转"""
+        agents = [MockAgent(responses=[f"output_{i}"]) for i in range(5)]
+
+        ctx = WorkflowContext()
+        engine = WorkflowEngine(verbose=False)
+
+        for i, agent in enumerate(agents):
+            engine.add_step(Step(
+                name=f"step_{i}",
+                agent=agent,
+                input_fn=lambda ctx, idx=i: ctx.get(f"step_{idx-1}_output", "start") if idx > 0 else "start",
+                output_fn=lambda ctx, out, idx=i: ctx.set(f"step_{idx}_output", out),
+            ))
+
+        ctx = engine.run(ctx)
+
+        assert ctx.get("step_0_output") == "output_0"
+        assert ctx.get("step_4_output") == "output_4"
+        assert len(ctx.step_results) == 5

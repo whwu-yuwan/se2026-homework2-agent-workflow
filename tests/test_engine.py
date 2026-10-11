@@ -28,7 +28,7 @@ class MockAgent:
         return resp
 
     def reset(self):
-        self._call_count = 0
+        pass  # 测试中不重置计数，保持顺序响应可预测
 
 
 class TestStep:
@@ -158,7 +158,7 @@ class TestLoopGroup:
 
         assert ctx.status == "completed"
         assert ctx.get("review_result") == "PASS: all good"
-        assert ctx.review_round == 3
+        assert ctx.get("review-fix_round") == 3
 
     def test_loop_max_rounds(self):
         """测试循环达到最大轮次"""
@@ -187,7 +187,7 @@ class TestLoopGroup:
 
         ctx = engine.run(ctx)
         assert ctx.status == "completed"
-        assert ctx.review_round == 3
+        assert ctx.get("infinite-loop_round") == 3
 
     def test_loop_skips_fix_when_pass(self):
         """测试审查通过时跳过修复步骤"""
@@ -329,19 +329,19 @@ class TestWorkflowContext:
         ctx.status = "running"
         assert ctx.status == "running"
 
-    def test_code_property(self):
+    def test_generic_data_access(self):
         ctx = WorkflowContext()
-        ctx.code = "print('hello')"
-        assert ctx.code == "print('hello')"
+        ctx.set("code", "print('hello')")
+        assert ctx.get("code") == "print('hello')"
 
-    def test_review_properties(self):
+    def test_workflow_specific_data(self):
         ctx = WorkflowContext()
-        ctx.review_result = "PASS"
-        ctx.review_round = 2
-        ctx.has_critical_issues = False
-        assert ctx.review_result == "PASS"
-        assert ctx.review_round == 2
-        assert not ctx.has_critical_issues
+        ctx.set("review_result", "PASS")
+        ctx.set("review_round", 2)
+        ctx.set("has_critical_issues", False)
+        assert ctx.get("review_result") == "PASS"
+        assert ctx.get("review_round") == 2
+        assert not ctx.get("has_critical_issues", False)
 
 
 class TestMixedExecution:

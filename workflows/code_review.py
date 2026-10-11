@@ -1,23 +1,20 @@
 """
 代码审查工作流定义
 编排 CodeAgent → ReviewAgent → FixAgent 的完整流程
-使用 AgentRegistry 进行动态 Agent 创建
+支持 Agent 间追问、registry 注入
 """
 
 import re
+from typing import Optional
 
 import config
-from workflow.engine import WorkflowEngine, Step, LoopGroup
+from workflow.engine import WorkflowEngine, Step, LoopGroup, AGENT_REQUEST_KEY, AGENT_RESPONSE_KEY
 from workflow.context import WorkflowContext
-from agents.registry import default_registry
+from agents.registry import AgentRegistry, default_registry
 
 
 def _parse_review_conclusion(review_output: str) -> bool:
-    """解析审查报告的结论
-
-    Returns:
-        True 表示有严重问题需要修复（NEEDS_FIX），False 表示通过（PASS）
-    """
+    """解析审查报告的结论: True=NEEDS_FIX, False=PASS"""
     for line in review_output.split('\n'):
         stripped = line.strip()
         if stripped.startswith("NEEDS_FIX"):
@@ -28,73 +25,78 @@ def _parse_review_conclusion(review_output: str) -> bool:
     return critical_count > 0
 
 
-# ─── 通用化的输入/输出函数 ────────────────────────────────────
-
-def _read_code_input(ctx: WorkflowContext) -> str:
-    """从上下文提取用户输入"""
-    return f"请读取并分析以下代码：\n\n{ctx.get('user_input', '')}"
-
-
-def _store_code(ctx: WorkflowContext, output: str) -> None:
-    """将 Agent 输出存为代码"""
-    ctx.set("code", output)
-
-
-def _review_input(ctx: WorkflowContext) -> str:
-    """构造审查输入（包含上一轮的 Agent 追问响应）"""
-    base = f"请审查以下代码，给出详细的审查报告：\n\n```python\n{ctx.get('code')}\n```"
-
-    # 如果有上一轮的 Agent 追问响应，附加到输入中
-    agent_response = ctx.get("_agent_response")
-    if agent_response:
-        base += f"\n\n## 补充信息（来自其他 Agent）\n{agent_response}"
-        ctx.set("_agent_response", None)  # 消费掉响应
-
-    # 如果有上一轮的追问历史，也附加
-    history = ctx.get("agent_request_history", [])
-    if history:
-        base += "\n\n## 追问历史\n"
-        for h in history[-3:]:  # 最多保留最近 3 条
-            base += f"- 请求: {h.get('request', '')} → 响应: {h.get('response', '')[:200]}\n"
-
-    return base
-
-
-def _store_review(ctx: WorkflowContext, output: str) -> None:
-    """存储审查结果，解析结论，并检查是否需要追问其他 Agent"""
-    ctx.set("review_result", output)
-    ctx.set("has_critical_issues", _parse_review_conclusion(output))
-
-    # 检查 ReviewAgent 的输出中是否包含追问请求
-    # 约定格式: Agent 可以在回复中写 "[REQUEST:CodeAgent] 请读取 xxx 文件"
-    _extract_agent_request(ctx, output, "ReviewAgent")
-
-
 def _extract_agent_request(ctx: WorkflowContext, output: str, from_agent: str) -> None:
     """从 Agent 输出中提取追问请求
 
     约定格式: [REQUEST:AgentName] 请求内容
-    例如: [REQUEST:CodeAgent] 请读取 utils.py 查看 import 依赖
     """
-    import re
     pattern = r'\[REQUEST:(\w+)\]\s*(.+?)(?:\n|$)'
     match = re.search(pattern, output)
     if match:
         target = match.group(1)
         message = match.group(2).strip()
-        ctx.set("_agent_request", {
+        ctx.set(AGENT_REQUEST_KEY, {
             "to": target,
             "message": message,
             "from": from_agent,
         })
-        # 记录追问历史
         history = ctx.get("agent_request_history", [])
         history.append({"from": from_agent, "to": target, "request": message})
         ctx.set("agent_request_history", history)
 
 
+def _record_agent_response(ctx: WorkflowContext) -> None:
+    """将上一轮的 Agent 响应记录到追问历史"""
+    response = ctx.get(AGENT_RESPONSE_KEY)
+    if not response:
+        return
+    history = ctx.get("agent_request_history", [])
+    if history and "response" not in history[-1]:
+        history[-1]["response"] = response[:500]
+        ctx.set("agent_request_history", history)
+
+
+# ─── 输入/输出函数 ──────────────────────────────────────────
+
+def _read_code_input(ctx: WorkflowContext) -> str:
+    return f"请读取并分析以下代码：\n\n{ctx.get('user_input', '')}"
+
+
+def _store_code(ctx: WorkflowContext, output: str) -> None:
+    ctx.set("code", output)
+
+
+def _review_input(ctx: WorkflowContext) -> str:
+    """构造审查输入，包含上一轮的 Agent 追问响应"""
+    base = f"请审查以下代码，给出详细的审查报告：\n\n```python\n{ctx.get('code')}\n```"
+
+    agent_response = ctx.get(AGENT_RESPONSE_KEY)
+    if agent_response:
+        base += f"\n\n## 补充信息（来自其他 Agent）\n{agent_response}"
+        ctx.set(AGENT_RESPONSE_KEY, None)
+
+    history = ctx.get("agent_request_history", [])
+    if history:
+        base += "\n\n## 追问历史\n"
+        for h in history[-3:]:
+            resp = h.get('response', '')
+            base += f"- 请求: {h.get('request', '')}"
+            if resp:
+                base += f" → 响应: {resp[:200]}"
+            base += "\n"
+
+    return base
+
+
+def _store_review(ctx: WorkflowContext, output: str) -> None:
+    """存储审查结果，解析结论，提取追问请求，记录响应到历史"""
+    ctx.set("review_result", output)
+    ctx.set("has_critical_issues", _parse_review_conclusion(output))
+    _extract_agent_request(ctx, output, "ReviewAgent")
+    _record_agent_response(ctx)
+
+
 def _fix_input(ctx: WorkflowContext) -> str:
-    """构造修复输入"""
     return (
         f"请根据以下审查报告修复代码。\n\n"
         f"## 原始代码\n```python\n{ctx.get('code')}\n```\n\n"
@@ -103,36 +105,44 @@ def _fix_input(ctx: WorkflowContext) -> str:
 
 
 def _has_issues(ctx: WorkflowContext) -> bool:
-    """检查是否有严重问题"""
     return ctx.get("has_critical_issues", False)
 
 
-def build_code_review_workflow(verbose: bool = True) -> WorkflowEngine:
-    """构建代码审查工作流
+def _consume_response_on_pass(ctx: WorkflowContext, output: str) -> None:
+    """PASS 路径：消费 Agent 响应并记录到历史，再标记无问题"""
+    ctx.set("review_result", output)
+    ctx.set("has_critical_issues", False)
+    _record_agent_response(ctx)
+    ctx.set(AGENT_RESPONSE_KEY, None)
 
-    流程：
-    1. CodeAgent 读取代码
-    2. [循环] ReviewAgent 审查 → 判断 → FixAgent 修复（最多 MAX_REVIEW_ROUNDS 轮）
+
+# ─── 工作流构建 ─────────────────────────────────────────────
+
+def build_code_review_workflow(
+    verbose: bool = True,
+    registry: Optional[AgentRegistry] = None,
+) -> WorkflowEngine:
+    """构建代码审查工作流
 
     Args:
         verbose: 是否实时打印执行日志
+        registry: Agent 注册表（None 则使用默认注册表，支持注入）
 
     Returns:
         配置好的工作流引擎
     """
-    # 通过注册表创建 Agent 实例
-    code_agent = default_registry.create("CodeAgent")
-    review_agent = default_registry.create("ReviewAgent")
-    fix_agent = default_registry.create("FixAgent")
+    reg = registry or default_registry
 
-    engine = WorkflowEngine(name="代码审查工作流", verbose=verbose)
+    code_agent = reg.create("CodeAgent")
+    review_agent = reg.create("ReviewAgent")
+    fix_agent = reg.create("FixAgent")
 
-    # 注册 Agent 用于 Agent 间请求路由
+    engine = WorkflowEngine(name="代码审查工作流", verbose=verbose, fail_fast=True)
+
     engine.register_agent(code_agent)
     engine.register_agent(review_agent)
     engine.register_agent(fix_agent)
 
-    # Step 1: CodeAgent 读取代码
     engine.add_step(Step(
         name="读取代码",
         agent=code_agent,
@@ -140,7 +150,6 @@ def build_code_review_workflow(verbose: bool = True) -> WorkflowEngine:
         output_fn=_store_code,
     ))
 
-    # LoopGroup: 审查 → 修复 循环
     engine.add_loop(LoopGroup(
         name="审查-修复循环",
         steps=[
@@ -160,13 +169,13 @@ def build_code_review_workflow(verbose: bool = True) -> WorkflowEngine:
         ],
         condition=_has_issues,
         max_rounds=config.MAX_REVIEW_ROUNDS,
+        reset_agents=True,
     ))
 
     return engine
 
 
 def run_code_review(user_input: str, verbose: bool = True) -> WorkflowContext:
-    """运行代码审查工作流（便捷入口）"""
     ctx = WorkflowContext(initial_data={"user_input": user_input})
     engine = build_code_review_workflow(verbose=verbose)
     return engine.run(ctx)

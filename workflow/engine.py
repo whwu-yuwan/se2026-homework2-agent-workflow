@@ -1,6 +1,6 @@
 """
 工作流引擎
-支持顺序执行、条件分支、循环控制、并行步骤、错误恢复
+支持顺序执行、条件分支、循环控制、并行执行、动态扇出、错误恢复
 """
 
 import logging
@@ -15,7 +15,6 @@ from exceptions import EngineError, StepError, WorkflowError
 
 logger = logging.getLogger(__name__)
 
-# Agent 间请求的上下文键名
 AGENT_REQUEST_KEY = "_agent_request"
 AGENT_RESPONSE_KEY = "_agent_response"
 
@@ -31,15 +30,6 @@ class Step:
         output_fn: Callable[[WorkflowContext, str], None],
         condition: Optional[Callable[[WorkflowContext], bool]] = None,
     ):
-        """定义一个工作流步骤
-
-        Args:
-            name: 步骤名称
-            agent: 执行此步骤的 Agent
-            input_fn: 从上下文提取输入的函数
-            output_fn: 将输出写入上下文的函数
-            condition: 执行条件（返回 True 才执行，None 表示无条件执行）
-        """
         self.name = name
         self.agent = agent
         self.input_fn = input_fn
@@ -48,10 +38,7 @@ class Step:
 
 
 class LoopGroup:
-    """循环步骤组
-
-    包含一组步骤，循环执行直到条件满足或达到最大轮次
-    """
+    """循环步骤组：循环执行直到条件满足或达到最大轮次"""
 
     def __init__(
         self,
@@ -59,37 +46,60 @@ class LoopGroup:
         steps: List[Step],
         condition: Callable[[WorkflowContext], bool],
         max_rounds: int = 3,
+        reset_agents: bool = True,
     ):
-        """定义循环步骤组
-
+        """
         Args:
-            name: 循环名称
-            steps: 循环内的步骤列表
-            condition: 继续循环的条件（返回 True 继续，False 停止）
-            max_rounds: 最大循环轮次
+            reset_agents: 每轮循环开始前是否重置 Agent 消息历史（防止 token 浪费）
         """
         self.name = name
         self.steps = steps
         self.condition = condition
         self.max_rounds = max_rounds
+        self.reset_agents = reset_agents
 
 
 class ParallelGroup:
-    """并行步骤组
-
-    包含一组步骤，同时并发执行（适用于独立任务，如同时审查多个文件）
-    """
+    """并行步骤组：构建时确定全部步骤，同时并发执行"""
 
     def __init__(self, name: str, steps: List[Step], max_workers: int = 4):
-        """定义并行步骤组
+        self.name = name
+        self.steps = steps
+        self.max_workers = max_workers
 
+
+class MapParallelStep:
+    """动态并行步骤：运行时根据上下文数据生成并行任务
+
+    解决 ParallelGroup 必须在构建时确定 steps 的限制。
+    运行时通过 items_fn 从上下文获取数据列表，为每个元素生成一个并行任务。
+
+    适用场景：CodeAgent 发现 N 个文件 → N 个并行分析任务（N 运行时才知道）
+    """
+
+    def __init__(
+        self,
+        name: str,
+        agent: BaseAgent,
+        items_fn: Callable[[WorkflowContext], List[Any]],
+        make_input_fn: Callable[[Any, WorkflowContext], str],
+        make_output_fn: Callable[[Any, WorkflowContext, str], None],
+        max_workers: int = 4,
+    ):
+        """
         Args:
-            name: 并行组名称
-            steps: 并行执行的步骤列表
+            name: 步骤名称
+            agent: 执行并行任务的 Agent
+            items_fn: 从上下文获取待处理元素列表
+            make_input_fn: (item, ctx) → 该元素的 Agent 输入
+            make_output_fn: (item, ctx, output) → 将该元素的输出写入上下文
             max_workers: 最大并发数
         """
         self.name = name
-        self.steps = steps
+        self.agent = agent
+        self.items_fn = items_fn
+        self.make_input_fn = make_input_fn
+        self.make_output_fn = make_output_fn
         self.max_workers = max_workers
 
 
@@ -97,109 +107,88 @@ class WorkflowEngine:
     """工作流引擎
 
     功能：
-    - 顺序执行步骤
-    - 条件分支（通过 Step.condition）
-    - 循环控制（通过 LoopGroup）
-    - 并行执行（通过 ParallelGroup，适用于独立任务）
-    - 错误恢复（单步失败可配置是否中断）
-    - 执行日志与状态追踪
+    - 顺序执行步骤（Step）
+    - 条件分支（Step.condition）
+    - 循环控制（LoopGroup，支持每轮 reset Agent）
+    - 静态并行（ParallelGroup，构建时确定步骤）
+    - 动态并行（MapParallelStep，运行时根据数据生成任务）
+    - 错误恢复（fail_fast 可配置，False 时记录错误继续执行）
+    - Agent 间追问（_agent_request/_agent_response 机制）
     """
 
-    def __init__(self, name: str = "workflow", verbose: bool = True):
-        """初始化引擎
-
+    def __init__(self, name: str = "workflow", verbose: bool = True, fail_fast: bool = True):
+        """
         Args:
-            name: 工作流名称
-            verbose: 是否实时打印执行日志
+            fail_fast: True=单步失败立即中断; False=记录错误继续执行（错误恢复）
         """
         self.name = name
         self._steps: List[Step] = []
         self._loop_groups: List[LoopGroup] = []
         self._parallel_groups: List[ParallelGroup] = []
-        self._execution_order: List[str] = []  # "step:name" | "loop:name" | "parallel:name"
+        self._map_steps: List[MapParallelStep] = []
+        self._execution_order: List[str] = []
         self._flow_logger = FlowLogger(verbose=verbose)
-        self._fail_fast = True
-        self._agent_registry: Dict[str, BaseAgent] = {}  # Agent 名称 → 实例（用于请求路由）
+        self._fail_fast = fail_fast
+        self._agent_registry: Dict[str, BaseAgent] = {}
 
     def register_agent(self, agent: BaseAgent) -> "WorkflowEngine":
-        """注册一个 Agent 用于 Agent 间请求路由"""
+        """注册 Agent 用于 Agent 间请求路由"""
         self._agent_registry[agent.name] = agent
         return self
 
     def add_step(self, step: Step) -> "WorkflowEngine":
-        """添加一个步骤"""
         self._steps.append(step)
         self._execution_order.append(f"step:{step.name}")
         return self
 
     def add_loop(self, loop: LoopGroup) -> "WorkflowEngine":
-        """添加一个循环组"""
         self._loop_groups.append(loop)
         self._execution_order.append(f"loop:{loop.name}")
         return self
 
     def add_parallel(self, parallel: ParallelGroup) -> "WorkflowEngine":
-        """添加一个并行组"""
         self._parallel_groups.append(parallel)
         self._execution_order.append(f"parallel:{parallel.name}")
         return self
 
+    def add_map_parallel(self, map_step: MapParallelStep) -> "WorkflowEngine":
+        """添加动态并行步骤"""
+        self._map_steps.append(map_step)
+        self._execution_order.append(f"map:{map_step.name}")
+        return self
+
+    # ─── 步骤执行 ──────────────────────────────────────────────
+
     def _run_step(self, step: Step, ctx: WorkflowContext) -> StepResult:
-        """执行单个步骤
-
-        Args:
-            step: 步骤定义
-            ctx: 工作流上下文
-
-        Returns:
-            步骤执行结果
-        """
-        # 检查条件
+        """执行单个步骤"""
         if step.condition and not step.condition(ctx):
             result = StepResult(
-                step_name=step.name,
-                agent_name=step.agent.name,
-                status="skipped",
-                output="(条件不满足，跳过)",
-                duration=0.0,
+                step_name=step.name, agent_name=step.agent.name,
+                status="skipped", output="(条件不满足，跳过)", duration=0.0,
             )
             self._flow_logger.on_step_end(result)
             ctx.add_step_result(result)
             return result
 
-        # 执行步骤
         self._flow_logger.on_step_start(step.name, step.agent.name)
         start_time = time.time()
 
         try:
-            # 从上下文提取输入
             user_input = step.input_fn(ctx)
-
-            # 调用 Agent
             output = step.agent.run(user_input)
-
-            # 将输出写入上下文
             step.output_fn(ctx, output)
-
             duration = time.time() - start_time
             result = StepResult(
-                step_name=step.name,
-                agent_name=step.agent.name,
-                status="success",
-                output=output,
-                duration=duration,
+                step_name=step.name, agent_name=step.agent.name,
+                status="success", output=output, duration=duration,
             )
-
         except Exception as e:
             duration = time.time() - start_time
             error_msg = f"{type(e).__name__}: {e}"
             logger.error(f"步骤 '{step.name}' 执行失败: {error_msg}")
             result = StepResult(
-                step_name=step.name,
-                agent_name=step.agent.name,
-                status="failed",
-                output=error_msg,
-                duration=duration,
+                step_name=step.name, agent_name=step.agent.name,
+                status="failed", output=error_msg, duration=duration,
                 metadata={"error": str(e), "error_type": type(e).__name__},
             )
 
@@ -209,35 +198,22 @@ class WorkflowEngine:
         if result.status == "failed" and self._fail_fast:
             raise StepError(step.name, result.output)
 
-        # 检查是否有 Agent 间请求需要分发
         if self._agent_registry:
             self._check_and_dispatch_request(ctx, self._agent_registry)
 
         return result
 
+    # ─── Agent 间请求路由 ──────────────────────────────────────
+
     def _check_and_dispatch_request(self, ctx: WorkflowContext, agents: Dict[str, BaseAgent]) -> None:
-        """检查上下文中的 Agent 请求并分发
-
-        Agent 间通信机制：一个 Agent 可以通过设置 ctx 中的 _agent_request
-        来请求另一个 Agent 执行任务。引擎在每步执行后检查并分发。
-
-        请求格式:
-            ctx.set("_agent_request", {
-                "to": "CodeAgent",          # 目标 Agent 名称
-                "message": "请读取 utils.py",  # 请求内容
-            })
-
-        响应格式:
-            ctx.get("_agent_response")  # 目标 Agent 的回复文本
-
-        Args:
-            ctx: 工作流上下文
-            agents: 可用的 Agent 字典 {name: agent_instance}
-        """
+        """检查并分发 Agent 间请求"""
         if not ctx.has(AGENT_REQUEST_KEY):
             return
 
         request = ctx.get(AGENT_REQUEST_KEY)
+        if not request:
+            return
+
         target_name = request.get("to", "")
         message = request.get("message", "")
 
@@ -252,82 +228,118 @@ class WorkflowEngine:
             ctx.set(AGENT_REQUEST_KEY, None)
             return
 
-        # 分发请求
         self._flow_logger.on_step_start(f"Agent请求→{target_name}", target_name)
         start_time = time.time()
 
         try:
             response = target_agent.run(message)
             ctx.set(AGENT_RESPONSE_KEY, response)
-            duration = time.time() - start_time
             result = StepResult(
-                step_name=f"Agent请求→{target_name}",
-                agent_name=target_name,
-                status="success",
-                output=response,
-                duration=duration,
+                step_name=f"Agent请求→{target_name}", agent_name=target_name,
+                status="success", output=response, duration=time.time() - start_time,
                 metadata={"request_from": request.get("from", "unknown")},
             )
         except Exception as e:
             ctx.set(AGENT_RESPONSE_KEY, f"[错误] {e}")
-            duration = time.time() - start_time
             result = StepResult(
-                step_name=f"Agent请求→{target_name}",
-                agent_name=target_name,
-                status="failed",
-                output=str(e),
-                duration=duration,
+                step_name=f"Agent请求→{target_name}", agent_name=target_name,
+                status="failed", output=str(e), duration=time.time() - start_time,
             )
 
         self._flow_logger.on_step_end(result)
         ctx.add_step_result(result)
-
-        # 清理请求（已处理）
         ctx.set(AGENT_REQUEST_KEY, None)
 
-    def _run_loop(self, loop: LoopGroup, ctx: WorkflowContext) -> None:
-        """执行循环组
+    # ─── 循环执行 ──────────────────────────────────────────────
 
-        Args:
-            loop: 循环组定义
-            ctx: 工作流上下文
-        """
+    def _run_loop(self, loop: LoopGroup, ctx: WorkflowContext) -> None:
+        """执行循环组，每轮开始前可选 reset Agent"""
         for round_num in range(1, loop.max_rounds + 1):
-            # 使用通用轮次计数器（同时兼容 review_round 便捷属性）
+            # 通用轮次计数器（唯一，不写业务字段）
             ctx.set(f"{loop.name}_round", round_num)
-            if hasattr(ctx, 'review_round'):
-                ctx.review_round = round_num
+
+            # 每轮 reset Agent 消息历史，防止 token 浪费
+            if loop.reset_agents and round_num > 1:
+                for step in loop.steps:
+                    step.agent.reset()
 
             self._flow_logger.on_loop_start(round_num, loop.max_rounds)
 
-            # 执行循环内的每个步骤
             for step in loop.steps:
                 self._run_step(step, ctx)
 
-            # 检查是否应该继续循环
             should_continue = loop.condition(ctx)
             self._flow_logger.on_loop_end(round_num, not should_continue)
 
             if not should_continue:
-                logger.info(f"循环 '{loop.name}' 在第 {round_num} 轮结束（条件不满足）")
                 break
         else:
             logger.warning(f"循环 '{loop.name}' 达到最大轮次 {loop.max_rounds}")
 
-    def _run_parallel(self, parallel: ParallelGroup, ctx: WorkflowContext) -> None:
-        """并行执行一组步骤
+    # ─── 静态并行 ──────────────────────────────────────────────
 
-        Args:
-            parallel: 并行组定义
-            ctx: 工作流上下文
-        """
+    def _run_parallel(self, parallel: ParallelGroup, ctx: WorkflowContext) -> None:
+        """并行执行一组步骤（构建时确定）"""
         self._flow_logger.on_step_start(parallel.name, f"并行({len(parallel.steps)}个)")
         start_time = time.time()
+        results = self._execute_parallel_steps(parallel.steps, ctx, parallel.max_workers)
 
+        duration = time.time() - start_time
+        success_count = sum(1 for r in results.values() if r.status == "success")
+        group_result = StepResult(
+            step_name=parallel.name, agent_name=f"并行组({len(parallel.steps)})",
+            status="success" if success_count == len(results) else "failed",
+            output=f"{success_count}/{len(results)} 成功", duration=duration,
+        )
+        self._flow_logger.on_step_end(group_result)
+        ctx.add_step_result(group_result)
+
+    # ─── 动态并行（map_parallel）──────────────────────────────
+
+    def _run_map_parallel(self, map_step: MapParallelStep, ctx: WorkflowContext) -> None:
+        """动态并行：运行时从上下文获取元素列表，为每个元素生成并行任务"""
+        items = map_step.items_fn(ctx)
+        if not items:
+            result = StepResult(
+                step_name=map_step.name, agent_name=map_step.agent.name,
+                status="skipped", output="(无待处理元素)", duration=0.0,
+            )
+            self._flow_logger.on_step_end(result)
+            ctx.add_step_result(result)
+            return
+
+        self._flow_logger.on_step_start(map_step.name, f"动态并行({len(items)}个)")
+        start_time = time.time()
+
+        # 为每个元素生成 Step
+        parallel_steps = []
+        for item in items:
+            step = Step(
+                name=f"{map_step.name}::{item}",
+                agent=map_step.agent,
+                input_fn=lambda ctx, i=item: map_step.make_input_fn(i, ctx),
+                output_fn=lambda ctx, output, i=item: map_step.make_output_fn(i, ctx, output),
+            )
+            parallel_steps.append(step)
+
+        results = self._execute_parallel_steps(parallel_steps, ctx, map_step.max_workers)
+
+        duration = time.time() - start_time
+        success_count = sum(1 for r in results.values() if r.status == "success")
+        group_result = StepResult(
+            step_name=map_step.name, agent_name=map_step.agent.name,
+            status="success" if success_count == len(results) else "failed",
+            output=f"{success_count}/{len(items)} 成功", duration=duration,
+        )
+        self._flow_logger.on_step_end(group_result)
+        ctx.add_step_result(group_result)
+
+    def _execute_parallel_steps(self, steps: List[Step], ctx: WorkflowContext, max_workers: int) -> Dict[str, StepResult]:
+        """通用并行执行逻辑，返回 {step_name: StepResult}"""
         results = {}
-        with ThreadPoolExecutor(max_workers=parallel.max_workers) as executor:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_step = {}
-            for step in parallel.steps:
+            for step in steps:
                 if step.condition and not step.condition(ctx):
                     continue
                 future = executor.submit(self._run_step, step, ctx)
@@ -336,44 +348,19 @@ class WorkflowEngine:
             for future in as_completed(future_to_step):
                 step = future_to_step[future]
                 try:
-                    result = future.result()
-                    results[step.name] = result
+                    results[step.name] = future.result()
                 except Exception as e:
                     logger.error(f"并行步骤 '{step.name}' 异常: {e}")
                     results[step.name] = StepResult(
-                        step_name=step.name,
-                        agent_name=step.agent.name,
-                        status="failed",
-                        output=str(e),
-                        duration=0.0,
+                        step_name=step.name, agent_name=step.agent.name,
+                        status="failed", output=str(e), duration=0.0,
                     )
+        return results
 
-        duration = time.time() - start_time
-        success_count = sum(1 for r in results.values() if r.status == "success")
-        status = "success" if success_count == len(results) else "failed"
-
-        group_result = StepResult(
-            step_name=parallel.name,
-            agent_name=f"并行组({len(parallel.steps)})",
-            status=status,
-            output=f"{success_count}/{len(results)} 成功",
-            duration=duration,
-        )
-        self._flow_logger.on_step_end(group_result)
-        ctx.add_step_result(group_result)
+    # ─── 主执行入口 ──────────────────────────────────────────
 
     def run(self, ctx: WorkflowContext) -> WorkflowContext:
-        """执行工作流
-
-        Args:
-            ctx: 工作流上下文
-
-        Returns:
-            更新后的上下文
-
-        Raises:
-            EngineError: 工作流执行失败
-        """
+        """执行工作流"""
         self._flow_logger.on_workflow_start(self.name)
         ctx.status = "running"
 
@@ -396,6 +383,11 @@ class WorkflowEngine:
                     if parallel:
                         self._run_parallel(parallel, ctx)
 
+                elif kind == "map":
+                    map_step = next((m for m in self._map_steps if m.name == name), None)
+                    if map_step:
+                        self._run_map_parallel(map_step, ctx)
+
             ctx.status = "completed"
             self._flow_logger.on_workflow_end("completed")
 
@@ -403,7 +395,6 @@ class WorkflowEngine:
             ctx.status = "failed"
             self._flow_logger.on_workflow_end("failed")
             raise EngineError(f"工作流执行失败: {e}") from e
-
         except Exception as e:
             ctx.status = "failed"
             self._flow_logger.on_workflow_end("failed")

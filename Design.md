@@ -101,19 +101,22 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A["用户输入代码/文件路径"] --> B["Step 1: CodeAgent 读取代码"]
-    B --> C["Step 2: ReviewAgent 分析代码结构"]
-    C --> D["Step 3: FixAgent 生成文档"]
+    A["用户输入路径"] --> B["Step 1: CodeAgent 发现文件"]
+    B --> C["MapParallelStep: 动态并行分析 N 个文件"]
+    C --> D["Step 2: FixAgent 合并生成文档"]
     D --> E["输出 README.md"]
 ```
+
+MapParallelStep 运行时从 `ctx.get("file_list")` 获取文件数量 N，动态生成 N 个并行分析任务。
 
 ### 2.4 关键设计决策
 
 1. **Step 抽象**：通过 `input_fn`/`output_fn` 与上下文交互，解耦 Agent 与工作流逻辑
 2. **条件执行**：Step.condition 控制单步是否执行，LoopGroup.condition 控制循环是否继续
-3. **并行执行**：ParallelGroup 使用 `ThreadPoolExecutor` 并发执行独立任务
-4. **最大轮次**：防止无限循环，默认 3 轮
-5. **通用轮次计数**：`ctx.set(f"{loop.name}_round", n)` 避免硬编码业务字段
+3. **静态并行**：ParallelGroup 构建时确定步骤，适用于已知任务数的场景
+4. **动态并行**：MapParallelStep 运行时根据上下文生成并行任务，适用于文件数运行时才知的场景
+5. **循环 Agent 重置**：LoopGroup.reset_agents 每轮清空 Agent 消息历史，防止 token 浪费
+6. **错误恢复**：fail_fast=False 时记录错误继续执行，不中断整个工作流
 
 ## 3. Agent 设计
 
@@ -356,21 +359,23 @@ sequenceDiagram
 
 ### 当前限制
 
-1. **并行步骤共享上下文**：并行步骤写入同一个 WorkflowContext，如果多个步骤写入相同 key 可能产生竞态。适用于写入不同 key 的独立任务。
+1. **并行步骤共享上下文竞态**：并行步骤写同一个 WorkflowContext，写相同 key 会竞态。当前 ParallelGroup/MapParallelStep 只能用于写不同 key 的场景（如每个文件写入 `file_analyses[file_path]`）。
 
-2. **System Prompt 硬编码为默认值**：虽然支持构造函数覆盖，但默认 prompt 仍以字符串常量定义在代码中，非配置文件驱动。
+2. **追问机制基于文本约定**：`[REQUEST:AgentName]` 格式是正则提取，非结构化协议，Agent 可能遗漏或格式不规范。
 
-3. **单用户 CLI 场景**：当前设计面向单用户命令行使用，未考虑多用户并发或 Web 服务场景。
+3. **PASS 路径追问闭环**：追问响应在下一轮审查时消费；若当轮审查结论为 PASS，LoopGroup 立即退出，追问得到的补充信息可能不被使用。已通过 `_record_agent_response` 在 PASS 路径也记录响应到历史来缓解。
 
-4. **追问机制基于约定**：`[REQUEST:AgentName]` 格式是文本约定，非结构化协议。
+4. **System Prompt 硬编码为默认值**：虽然支持构造函数覆盖，但默认 prompt 仍以字符串常量定义在代码中，非配置文件驱动。
+
+5. **单用户 CLI 场景**：当前设计面向单用户命令行使用，未考虑多用户并发或 Web 服务场景。
 
 ### 未来改进方向
 
-1. **结构化 Agent 通信协议**：将 `[REQUEST:...]` 升级为结构化的 JSON 消息格式
-2. **配置驱动工作流**：通过 YAML/JSON 定义工作流，无需写 Python 代码
-3. **持久化状态**：支持工作流断点续跑、执行历史持久化
-4. **可视化编排界面**：拖拽式工作流设计器
-5. **并行步骤安全写入**：为每个并行步骤提供独立的上下文副本，合并后写入主上下文
+1. **结构化 Agent 通信协议**：将 `[REQUEST:...]` 升级为 JSON 消息格式，支持多轮对话式追问
+2. **并行步骤安全写入**：为每个并行步骤提供独立的上下文副本，合并后写入主上下文
+3. **配置驱动工作流**：通过 YAML/JSON 定义工作流，无需写 Python 代码
+4. **持久化状态**：支持工作流断点续跑、执行历史持久化
+5. **可视化编排界面**：拖拽式工作流设计器
 
 ## 9. 测试策略
 
@@ -378,13 +383,13 @@ sequenceDiagram
 
 | 测试文件 | 用例数 | 覆盖范围 |
 |----------|--------|----------|
-| test_tools.py | 22 | 4 个工具的功能和边界 |
-| test_agents.py | 30 | Agent 初始化、run() 循环、工具调用、裁剪 |
-| test_engine.py | 29 | 引擎编排、条件分支、循环、并行 |
-| test_workflow.py | 15 | 结论解析、端到端集成、文档生成 |
-| test_flow_logger.py | 17 | 执行日志全流程 |
+| test_tools.py | 33 | 4 个工具的功能和边界 |
+| test_agents.py | 24 | Agent 初始化、run() 循环、工具调用、裁剪 |
+| test_engine.py | 33 | 引擎编排、条件分支、循环、并行 |
+| test_workflow.py | 18 | 结论解析、端到端集成、文档生成 |
+| test_flow_logger.py | 18 | 执行日志全流程 |
 | test_main.py | 13 | CLI 命令处理、工作流配置 |
-| test_registry.py | 7 | Agent 注册与发现 |
+| test_registry.py | 6 | Agent 注册与发现 |
 | **合计** | **145** | |
 
 ### 9.2 测试方法

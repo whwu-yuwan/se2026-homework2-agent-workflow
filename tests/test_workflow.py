@@ -53,27 +53,23 @@ class TestWorkflowContext:
         """模拟数据在工作流中的流动"""
         ctx = WorkflowContext({"user_input": "test.py"})
 
-        # Step 1: CodeAgent 输出
-        ctx.code = "def divide(a, b):\n    return a / b"
-        assert ctx.code is not None
+        ctx.set("code", "def divide(a, b):\n    return a / b")
+        assert ctx.get("code") is not None
 
-        # Step 2: ReviewAgent 输出
-        ctx.review_result = "[critical] 除零风险\n\nNEEDS_FIX"
-        ctx.has_critical_issues = True
-        assert ctx.has_critical_issues is True
+        ctx.set("review_result", "[critical] 除零风险\n\nNEEDS_FIX")
+        ctx.set("has_critical_issues", True)
+        assert ctx.get("has_critical_issues") is True
 
-        # Step 3: FixAgent 输出
-        ctx.code = "def divide(a, b):\n    if b == 0:\n        raise ValueError\n    return a / b"
-        ctx.review_round = 1
+        ctx.set("code", "def divide(a, b):\n    if b == 0:\n        raise ValueError\n    return a / b")
+        ctx.set("审查-修复循环_round", 1)
 
-        # Step 4: 再次审查
-        ctx.review_result = "PASS"
-        ctx.has_critical_issues = False
-        ctx.review_round = 2
+        ctx.set("review_result", "PASS")
+        ctx.set("has_critical_issues", False)
+        ctx.set("审查-修复循环_round", 2)
 
-        assert ctx.has_critical_issues is False
-        assert ctx.review_round == 2
-        assert "ValueError" in ctx.code
+        assert ctx.get("has_critical_issues") is False
+        assert ctx.get("审查-修复循环_round") == 2
+        assert "ValueError" in ctx.get("code")
 
     def test_context_status_lifecycle(self):
         """测试上下文状态生命周期"""
@@ -110,22 +106,22 @@ class TestEndToEndWorkflow:
     """端到端工作流集成测试（Mock Agent）"""
 
     def _make_mock_agent(self, name, responses):
-        from unittest.mock import MagicMock
-        agent = MagicMock()
-        agent.name = name
-        agent._responses = list(responses)
-        agent._call_count = 0
-
-        def side_effect(user_input):
-            if agent._call_count < len(agent._responses):
-                resp = agent._responses[agent._call_count]
-            else:
-                resp = agent._responses[-1]
-            agent._call_count += 1
-            return resp
-
-        agent.run = side_effect
-        return agent
+        """创建一个模拟 Agent（非 MagicMock，避免 reset() 干扰）"""
+        class _MockAgent:
+            def __init__(self, name, responses):
+                self.name = name
+                self._responses = list(responses)
+                self._call_count = 0
+            def run(self, user_input):
+                if self._call_count < len(self._responses):
+                    resp = self._responses[self._call_count]
+                else:
+                    resp = self._responses[-1]
+                self._call_count += 1
+                return resp
+            def reset(self):
+                pass  # 保持 _call_count 不变，测试可预测
+        return _MockAgent(name, responses)
 
     def test_pass_first_round(self):
         """测试第一轮审查就通过（无需修复）"""
@@ -144,8 +140,8 @@ class TestEndToEndWorkflow:
             ctx = engine.run(ctx)
 
         assert ctx.status == "completed"
-        assert ctx.code == "def hello(): pass"
-        assert ctx.has_critical_issues is False
+        assert ctx.get("code") == "def hello(): pass"
+        assert ctx.get("has_critical_issues", False) is False
 
     def test_fix_then_pass(self):
         """测试第一轮有问题，修复后通过"""
@@ -169,8 +165,8 @@ class TestEndToEndWorkflow:
             ctx = engine.run(ctx)
 
         assert ctx.status == "completed"
-        assert "ValueError" in ctx.code
-        assert ctx.review_round == 2
+        assert "ValueError" in ctx.get("code")
+        assert ctx.get("审查-修复循环_round") == 2
 
     def test_max_rounds_reached(self):
         """测试达到最大循环轮次"""
@@ -194,7 +190,7 @@ class TestEndToEndWorkflow:
             ctx = engine.run(ctx)
 
         assert ctx.status == "completed"
-        assert ctx.review_round == cfg.MAX_REVIEW_ROUNDS
+        assert ctx.get("审查-修复循环_round") == cfg.MAX_REVIEW_ROUNDS
 
 
 class TestDocGenerationWorkflow:
@@ -206,7 +202,8 @@ class TestDocGenerationWorkflow:
         engine = build_doc_generation_workflow(verbose=False)
         assert engine is not None
         assert engine.name == "文档生成工作流"
-        assert len(engine._steps) == 3
+        assert len(engine._steps) == 2           # 发现文件 + 生成文档
+        assert len(engine._map_steps) == 1       # 并行分析文件
         assert len(engine._loop_groups) == 0
 
     @patch("workflows.doc_generation.default_registry")
@@ -214,20 +211,19 @@ class TestDocGenerationWorkflow:
         """测试文档生成工作流步骤编排"""
         from unittest.mock import MagicMock
 
-        # CodeAgent: 发现文件 + 并行分析
         mock_code_agent = MagicMock()
         mock_code_agent.name = "CodeAgent"
-        mock_code_agent.run = MagicMock(side_effect=[
-            "test.py\nutils.py",          # 发现文件
-            "模块分析: test.py 和 utils.py",  # 并行分析
-        ])
+        mock_code_agent.run = MagicMock(return_value="test.py\nutils.py")
 
-        # FixAgent: 生成文档
+        mock_review_agent = MagicMock()
+        mock_review_agent.name = "ReviewAgent"
+        mock_review_agent.run = MagicMock(return_value="文件分析报告")
+
         mock_fix_agent = MagicMock()
         mock_fix_agent.name = "FixAgent"
         mock_fix_agent.run = MagicMock(return_value="# README\nDocumentation")
 
-        mock_registry.create.side_effect = [mock_code_agent, mock_fix_agent]
+        mock_registry.create.side_effect = [mock_code_agent, mock_fix_agent, mock_review_agent]
 
         ctx = WorkflowContext({"user_input": "test.py"})
         engine = build_doc_generation_workflow(verbose=False)
@@ -235,7 +231,7 @@ class TestDocGenerationWorkflow:
 
         assert ctx.status == "completed"
         assert ctx.get("file_list") == ["test.py", "utils.py"]
-        assert ctx.get("analysis") is not None
+        assert ctx.get("file_analyses") is not None
         assert ctx.get("documentation") == "# README\nDocumentation"
 
 

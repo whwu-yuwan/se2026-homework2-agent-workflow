@@ -5,8 +5,8 @@
 ## ✨ 功能特性
 
 - **3 个 Agent 协同**：CodeAgent（读取代码）、ReviewAgent（审查/分析）、FixAgent（修复/生成文档）
-- **2 个工作流**：代码审查（审查→修复循环）、文档生成（分析→生成文档）
-- **工作流引擎**：支持顺序执行、条件分支、循环控制、**并行执行**
+- **2 个工作流**：代码审查（审查→修复循环）、文档生成（动态并行分析→生成文档）
+- **工作流引擎**：支持顺序执行、条件分支、循环控制、静态并行（ParallelGroup）、动态并行（MapParallelStep）
 - **Agent 注册机制**：通过 AgentRegistry 动态创建 Agent，支持自定义 prompt 和 tools
 - **共享状态管理**：Agent 通过 WorkflowContext 传递数据
 - **执行日志**：实时显示每步执行状态和耗时
@@ -61,14 +61,14 @@ task2/
 ├── workflows/
 │   ├── code_review.py         # 代码审查工作流
 │   └── doc_generation.py      # 文档生成工作流
-└── tests/                     # 138 个测试
-    ├── test_tools.py          # 工具测试 (22)
-    ├── test_agents.py         # Agent 测试 (30)
-    ├── test_engine.py         # 引擎测试 (29)
-    ├── test_workflow.py       # 工作流测试 (15)
-    ├── test_flow_logger.py    # 日志测试 (17)
+└── tests/                     # 145 个测试
+    ├── test_tools.py          # 工具测试 (33)
+    ├── test_agents.py         # Agent 测试 (24)
+    ├── test_engine.py         # 引擎测试 (33)
+    ├── test_workflow.py       # 工作流测试 (18)
+    ├── test_flow_logger.py    # 日志测试 (18)
     ├── test_main.py           # CLI 测试 (13)
-    └── test_registry.py       # 注册表测试 (7)
+    └── test_registry.py       # 注册表测试 (6)
 ```
 
 ## 🧪 运行测试

@@ -15,6 +15,10 @@ from exceptions import EngineError, StepError, WorkflowError
 
 logger = logging.getLogger(__name__)
 
+# Agent 间请求的上下文键名
+AGENT_REQUEST_KEY = "_agent_request"
+AGENT_RESPONSE_KEY = "_agent_response"
+
 
 class Step:
     """工作流步骤定义"""
@@ -115,6 +119,12 @@ class WorkflowEngine:
         self._execution_order: List[str] = []  # "step:name" | "loop:name" | "parallel:name"
         self._flow_logger = FlowLogger(verbose=verbose)
         self._fail_fast = True
+        self._agent_registry: Dict[str, BaseAgent] = {}  # Agent 名称 → 实例（用于请求路由）
+
+    def register_agent(self, agent: BaseAgent) -> "WorkflowEngine":
+        """注册一个 Agent 用于 Agent 间请求路由"""
+        self._agent_registry[agent.name] = agent
+        return self
 
     def add_step(self, step: Step) -> "WorkflowEngine":
         """添加一个步骤"""
@@ -199,7 +209,81 @@ class WorkflowEngine:
         if result.status == "failed" and self._fail_fast:
             raise StepError(step.name, result.output)
 
+        # 检查是否有 Agent 间请求需要分发
+        if self._agent_registry:
+            self._check_and_dispatch_request(ctx, self._agent_registry)
+
         return result
+
+    def _check_and_dispatch_request(self, ctx: WorkflowContext, agents: Dict[str, BaseAgent]) -> None:
+        """检查上下文中的 Agent 请求并分发
+
+        Agent 间通信机制：一个 Agent 可以通过设置 ctx 中的 _agent_request
+        来请求另一个 Agent 执行任务。引擎在每步执行后检查并分发。
+
+        请求格式:
+            ctx.set("_agent_request", {
+                "to": "CodeAgent",          # 目标 Agent 名称
+                "message": "请读取 utils.py",  # 请求内容
+            })
+
+        响应格式:
+            ctx.get("_agent_response")  # 目标 Agent 的回复文本
+
+        Args:
+            ctx: 工作流上下文
+            agents: 可用的 Agent 字典 {name: agent_instance}
+        """
+        if not ctx.has(AGENT_REQUEST_KEY):
+            return
+
+        request = ctx.get(AGENT_REQUEST_KEY)
+        target_name = request.get("to", "")
+        message = request.get("message", "")
+
+        if not target_name or not message:
+            ctx.set(AGENT_REQUEST_KEY, None)
+            return
+
+        target_agent = agents.get(target_name)
+        if not target_agent:
+            logger.warning(f"Agent 请求目标不存在: {target_name}")
+            ctx.set(AGENT_RESPONSE_KEY, f"[错误] 未找到 Agent: {target_name}")
+            ctx.set(AGENT_REQUEST_KEY, None)
+            return
+
+        # 分发请求
+        self._flow_logger.on_step_start(f"Agent请求→{target_name}", target_name)
+        start_time = time.time()
+
+        try:
+            response = target_agent.run(message)
+            ctx.set(AGENT_RESPONSE_KEY, response)
+            duration = time.time() - start_time
+            result = StepResult(
+                step_name=f"Agent请求→{target_name}",
+                agent_name=target_name,
+                status="success",
+                output=response,
+                duration=duration,
+                metadata={"request_from": request.get("from", "unknown")},
+            )
+        except Exception as e:
+            ctx.set(AGENT_RESPONSE_KEY, f"[错误] {e}")
+            duration = time.time() - start_time
+            result = StepResult(
+                step_name=f"Agent请求→{target_name}",
+                agent_name=target_name,
+                status="failed",
+                output=str(e),
+                duration=duration,
+            )
+
+        self._flow_logger.on_step_end(result)
+        ctx.add_step_result(result)
+
+        # 清理请求（已处理）
+        ctx.set(AGENT_REQUEST_KEY, None)
 
     def _run_loop(self, loop: LoopGroup, ctx: WorkflowContext) -> None:
         """执行循环组

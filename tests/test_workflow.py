@@ -7,7 +7,7 @@ import pytest
 from unittest.mock import patch, MagicMock
 
 from workflow.context import WorkflowContext
-from workflows.code_review import _parse_review_conclusion, build_code_review_workflow
+from workflows.code_review import _parse_review_conclusion, _extract_agent_request, build_code_review_workflow
 from workflows.doc_generation import build_doc_generation_workflow
 
 
@@ -213,26 +213,61 @@ class TestDocGenerationWorkflow:
     def test_doc_workflow_steps(self, mock_registry):
         """测试文档生成工作流步骤编排"""
         from unittest.mock import MagicMock
+
+        # CodeAgent: 发现文件 + 并行分析
         mock_code_agent = MagicMock()
         mock_code_agent.name = "CodeAgent"
-        mock_code_agent.run = MagicMock(return_value="code content")
+        mock_code_agent.run = MagicMock(side_effect=[
+            "test.py\nutils.py",          # 发现文件
+            "模块分析: test.py 和 utils.py",  # 并行分析
+        ])
 
-        mock_review_agent = MagicMock()
-        mock_review_agent.name = "ReviewAgent"
-        mock_review_agent.run = MagicMock(return_value="analysis report")
-
+        # FixAgent: 生成文档
         mock_fix_agent = MagicMock()
         mock_fix_agent.name = "FixAgent"
         mock_fix_agent.run = MagicMock(return_value="# README\nDocumentation")
 
-        mock_registry.create.side_effect = [mock_code_agent, mock_review_agent, mock_fix_agent]
+        mock_registry.create.side_effect = [mock_code_agent, mock_fix_agent]
 
         ctx = WorkflowContext({"user_input": "test.py"})
         engine = build_doc_generation_workflow(verbose=False)
         ctx = engine.run(ctx)
 
         assert ctx.status == "completed"
-        assert ctx.get("code") == "code content"
-        assert ctx.get("analysis") == "analysis report"
+        assert ctx.get("file_list") == ["test.py", "utils.py"]
+        assert ctx.get("analysis") is not None
         assert ctx.get("documentation") == "# README\nDocumentation"
-        assert ctx.get("analysis_done") is True
+
+
+class TestAgentRequestExtraction:
+    """测试 Agent 间追问请求提取"""
+
+    def test_extract_request(self):
+        """测试从 Agent 输出中提取请求"""
+        ctx = WorkflowContext()
+        output = "发现问题\n[REQUEST:CodeAgent] 请读取 utils.py 的 import 依赖"
+        _extract_agent_request(ctx, output, "ReviewAgent")
+
+        request = ctx.get("_agent_request")
+        assert request is not None
+        assert request["to"] == "CodeAgent"
+        assert "请读取 utils.py" in request["message"]
+        assert request["from"] == "ReviewAgent"
+
+    def test_no_request_in_output(self):
+        """测试输出中没有请求"""
+        ctx = WorkflowContext()
+        output = "代码质量良好\nPASS"
+        _extract_agent_request(ctx, output, "ReviewAgent")
+        assert ctx.get("_agent_request") is None
+
+    def test_request_history(self):
+        """测试追问历史记录"""
+        ctx = WorkflowContext()
+        _extract_agent_request(ctx, "[REQUEST:CodeAgent] 读取 a.py", "ReviewAgent")
+        ctx.set("_agent_request", None)  # 模拟已处理
+        _extract_agent_request(ctx, "[REQUEST:CodeAgent] 读取 b.py", "ReviewAgent")
+
+        history = ctx.get("agent_request_history")
+        assert len(history) == 2
+        assert history[0]["request"] == "读取 a.py"

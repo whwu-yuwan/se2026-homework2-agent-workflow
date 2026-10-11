@@ -10,7 +10,7 @@
 - **Agent 注册机制**：通过 AgentRegistry 动态创建 Agent，支持自定义 prompt 和 tools
 - **共享状态管理**：Agent 通过 WorkflowContext 传递数据
 - **执行日志**：实时显示每步执行状态和耗时
-- **138 个测试全部通过**
+- **145 个测试全部通过**
 
 ## 🛠️ 技术栈
 

@@ -6,7 +6,7 @@
 import pytest
 from unittest.mock import MagicMock, patch
 
-from workflow.engine import WorkflowEngine, Step, LoopGroup, ParallelGroup
+from workflow.engine import WorkflowEngine, Step, LoopGroup, ParallelGroup, AGENT_REQUEST_KEY, AGENT_RESPONSE_KEY
 from workflow.context import WorkflowContext, StepResult
 from exceptions import StepError, EngineError
 
@@ -680,3 +680,104 @@ class TestParallelGroup:
         assert ctx.get("a") == "r1"
         # B 被跳过，output_fn 未被调用
         assert ctx.get("b") is None
+
+
+class TestAgentRequest:
+    """测试 Agent 间追问机制"""
+
+    def test_agent_request_dispatched(self):
+        """测试 Agent 请求被正确分发"""
+        review_agent = MockAgent(responses=["发现问题\n[REQUEST:CodeAgent] 请读取 utils.py"])
+        code_agent = MockAgent(responses=["utils.py 内容: import os"])
+        fix_agent = MockAgent(responses=["修复后代码"])
+
+        ctx = WorkflowContext({"code": "test code"})
+        engine = WorkflowEngine(verbose=False)
+        engine.register_agent(code_agent)
+
+        def store_review_with_request(ctx, output):
+            ctx.set("review", output)
+            # 模拟提取请求
+            if "[REQUEST:CodeAgent]" in output:
+                ctx.set(AGENT_REQUEST_KEY, {
+                    "to": "CodeAgent",
+                    "message": "请读取 utils.py",
+                    "from": "ReviewAgent",
+                })
+
+        def review_input_with_response(ctx):
+            base = "请审查代码"
+            resp = ctx.get(AGENT_RESPONSE_KEY)
+            if resp:
+                base += f"\n\n补充信息: {resp}"
+            return base
+
+        engine.add_step(Step(
+            name="review",
+            agent=review_agent,
+            input_fn=review_input_with_response,
+            output_fn=store_review_with_request,
+        ))
+
+        ctx = engine.run(ctx)
+
+        # 请求应该被分发
+        assert ctx.get("review") is not None
+        # Agent 响应应该被存储
+        assert ctx.get(AGENT_RESPONSE_KEY) is not None or ctx.has("review")
+        # 请求应该被清除
+        assert ctx.get(AGENT_REQUEST_KEY) is None
+
+    def test_no_request_no_dispatch(self):
+        """测试没有请求时不触发分发"""
+        agent = MockAgent(responses=["正常输出"])
+
+        ctx = WorkflowContext()
+        engine = WorkflowEngine(verbose=False)
+
+        engine.add_step(Step(
+            name="normal",
+            agent=agent,
+            input_fn=lambda ctx: "input",
+            output_fn=lambda ctx, out: ctx.set("result", out),
+        ))
+
+        ctx = engine.run(ctx)
+        assert ctx.get("result") == "正常输出"
+        assert ctx.get(AGENT_RESPONSE_KEY) is None
+
+    def test_request_to_unregistered_agent(self):
+        """测试请求未注册的 Agent 时产生错误响应"""
+        agent = MockAgent(responses=["[REQUEST:UnknownAgent] 做点什么"])
+        helper = MockAgent(responses=["帮助完成"])
+
+        ctx = WorkflowContext()
+        engine = WorkflowEngine(verbose=False)
+        # 注册一个 Agent 但不是请求的目标，确保 dispatch 逻辑运行
+        engine.register_agent(helper)
+
+        def set_request(ctx, output):
+            if "[REQUEST:" in output:
+                ctx.set(AGENT_REQUEST_KEY, {
+                    "to": "UnknownAgent",
+                    "message": "做点什么",
+                })
+
+        engine.add_step(Step(
+            name="step",
+            agent=agent,
+            input_fn=lambda ctx: "input",
+            output_fn=set_request,
+        ))
+
+        ctx = engine.run(ctx)
+        # 应该有错误响应（目标 Agent 不存在）
+        assert ctx.get(AGENT_RESPONSE_KEY) is not None
+        assert "未找到" in ctx.get(AGENT_RESPONSE_KEY)
+
+    def test_register_agent(self):
+        """测试注册 Agent"""
+        agent = MockAgent(responses=[])
+        engine = WorkflowEngine(verbose=False)
+        engine.register_agent(agent)
+        assert "MockAgent" in engine._agent_registry

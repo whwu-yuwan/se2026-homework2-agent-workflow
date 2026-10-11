@@ -333,19 +333,40 @@ engine.add_parallel(ParallelGroup(
 
 ## 8. 已知限制与未来改进
 
+### Agent 间追问机制
+
+```mermaid
+sequenceDiagram
+    participant E as Engine
+    participant R as ReviewAgent
+    participant C as CodeAgent
+
+    E->>R: 审查代码
+    R-->>R: 发现需要查看依赖文件
+    R->>E: 输出 + [REQUEST:CodeAgent] 请读取 utils.py
+    E->>E: 检测到 _agent_request
+    E->>C: 分发请求: 请读取 utils.py
+    C->>E: utils.py 内容
+    E->>E: 存储 _agent_response
+    E->>R: 下一轮审查（附带 CodeAgent 的响应）
+    R->>E: 基于补充信息的审查报告
+```
+
+约定格式：Agent 在回复中写 `[REQUEST:AgentName] 请求内容`，引擎自动分发。
+
 ### 当前限制
 
-1. **Agent 间无直接通信**：当前是单向数据流（流水线模式），Agent 无法向其他 Agent 追问或协商。LoopGroup 提供了间接反馈循环，但不是真正的 Agent 间对话。
+1. **并行步骤共享上下文**：并行步骤写入同一个 WorkflowContext，如果多个步骤写入相同 key 可能产生竞态。适用于写入不同 key 的独立任务。
 
-2. **并行步骤共享上下文**：并行步骤写入同一个 WorkflowContext，如果多个步骤写入相同 key 可能产生竞态。适用于写入不同 key 的独立任务。
+2. **System Prompt 硬编码为默认值**：虽然支持构造函数覆盖，但默认 prompt 仍以字符串常量定义在代码中，非配置文件驱动。
 
-3. **System Prompt 硬编码为默认值**：虽然支持构造函数覆盖，但默认 prompt 仍以字符串常量定义在代码中，非配置文件驱动。
+3. **单用户 CLI 场景**：当前设计面向单用户命令行使用，未考虑多用户并发或 Web 服务场景。
 
-4. **单用户 CLI 场景**：当前设计面向单用户命令行使用，未考虑多用户并发或 Web 服务场景。
+4. **追问机制基于约定**：`[REQUEST:AgentName]` 格式是文本约定，非结构化协议。
 
 ### 未来改进方向
 
-1. **Agent 间直接通信**：引入消息总线或请求-响应机制，允许 Agent 互相追问
+1. **结构化 Agent 通信协议**：将 `[REQUEST:...]` 升级为结构化的 JSON 消息格式
 2. **配置驱动工作流**：通过 YAML/JSON 定义工作流，无需写 Python 代码
 3. **持久化状态**：支持工作流断点续跑、执行历史持久化
 4. **可视化编排界面**：拖拽式工作流设计器
@@ -364,7 +385,7 @@ engine.add_parallel(ParallelGroup(
 | test_flow_logger.py | 17 | 执行日志全流程 |
 | test_main.py | 13 | CLI 命令处理、工作流配置 |
 | test_registry.py | 7 | Agent 注册与发现 |
-| **合计** | **138** | |
+| **合计** | **145** | |
 
 ### 9.2 测试方法
 
